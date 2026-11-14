@@ -1,5 +1,5 @@
 # Esqueleto inicial: solo bases de datos.
-# Próximos servicios: FastAPI, MLflow, Airflow.
+# Próximos servicios: FastAPI, Airflow.
 
 x-postgres: &postgres-base
   image: postgres:17.12
@@ -38,10 +38,39 @@ services:
       retries: 5
       start_period: 10s
 
-# Sin "ports": las bases solo son accesibles dentro de esta red.
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@mlflow-db:5432/${MLFLOW_DB_NAME}
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+# Sin "ports" en las bases: solo son accesibles dentro de esta red.
 networks:
   backend:
 
 volumes:
   app_db_data:
   mlflow_db_data:
+  mlflow_artifacts:
