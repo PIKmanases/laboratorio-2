@@ -1,5 +1,5 @@
 # Esqueleto inicial: solo bases de datos.
-# Próximos servicios: FastAPI, Airflow.
+# Próximo servicio: Airflow.
 
 x-postgres: &postgres-base
   image: postgres:17.12
@@ -65,6 +65,25 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      app-db:
+        condition: service_healthy
+      # started (no healthy): la API debe arrancar y responder aunque MLflow esté caído.
+      mlflow:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    networks:
+      - backend
 
 # Sin "ports" en las bases: solo son accesibles dentro de esta red.
 networks:
