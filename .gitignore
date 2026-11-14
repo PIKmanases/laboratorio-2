@@ -49,3 +49,7 @@ data/processed/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Airflow (logs y config generada)
+airflow/logs/
+airflow/config/airflow.cfg
