@@ -1,0 +1,24 @@
+# Normalizar finales de línea
+* text=auto eol=lf
+
+# Código y texto
+*.py    text diff=python
+*.md    text diff=markdown
+*.txt   text
+*.yml   text
+*.yaml  text
+*.json  text
+*.toml  text
+*.cfg   text
+*.sh    text eol=lf
+
+# Notebooks: tratarlos como texto, sin diff ruidoso
+*.ipynb text eol=lf -diff
+
+# Binarios
+*.png  binary
+*.jpg  binary
+*.pkl  binary
+*.joblib binary
+*.h5   binary
+*.parquet binary
