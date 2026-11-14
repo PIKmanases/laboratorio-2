@@ -1,0 +1,47 @@
+# Esqueleto inicial: solo bases de datos.
+# Próximos servicios: FastAPI, MLflow, Airflow.
+
+x-postgres: &postgres-base
+  image: postgres:17.12
+  restart: unless-stopped
+  networks:
+    - backend
+
+services:
+  app-db:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: ${APP_DB_NAME}
+      POSTGRES_USER: ${APP_DB_USER}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
+    volumes:
+      - app_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  mlflow-db:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: ${MLFLOW_DB_NAME}
+      POSTGRES_USER: ${MLFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD}
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# Sin "ports": las bases solo son accesibles dentro de esta red.
+networks:
+  backend:
+
+volumes:
+  app_db_data:
+  mlflow_db_data:
