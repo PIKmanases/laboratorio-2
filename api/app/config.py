@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     database_url: str
     mlflow_tracking_uri: str
 
+    # Carpeta con los CSV (tiendas, familias, histórico). Se monta como volumen, no va en la imagen.
+    data_dir: str = "/data"
+
     # Chequeos en segundo plano. Peor caso para detectar una caída:
     # intervalo + timeout < 60 s.
     health_check_interval: float = 15.0
