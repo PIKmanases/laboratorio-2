@@ -21,8 +21,16 @@ x-airflow-common:
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME}
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # Poca RAM (WSL2 ~4-5 GB): menos concurrencia y procesos.
+    AIRFLOW__CORE__PARALLELISM: '4'
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: '4'
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: '1'
+    AIRFLOW__API_SERVER__WORKERS: '1'
+    # Conexiones que usan los DAGs (nunca escritas en el código).
+    APP_DB_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
+    MLFLOW_TRACKING_URI: http://mlflow:5000
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
     AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
@@ -43,11 +51,14 @@ x-airflow-common:
     &airflow-common-depends-on
     airflow-db:
       condition: service_healthy
+    app-db:
+      condition: service_healthy
   networks:
     - backend
 
 services:
   app-db:
+    mem_limit: 256m
     <<: *postgres-base
     environment:
       POSTGRES_DB: ${APP_DB_NAME}
@@ -63,6 +74,7 @@ services:
       start_period: 10s
 
   mlflow-db:
+    mem_limit: 256m
     <<: *postgres-base
     environment:
       POSTGRES_DB: ${MLFLOW_DB_NAME}
@@ -78,6 +90,7 @@ services:
       start_period: 10s
 
   mlflow:
+    mem_limit: 768m
     build:
       context: .
       dockerfile: docker/mlflow.Dockerfile
@@ -92,6 +105,8 @@ services:
       --backend-store-uri postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@mlflow-db:5432/${MLFLOW_DB_NAME}
       --artifacts-destination /mlflow/artifacts
       --serve-artifacts
+      --workers 1
+      --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000
     ports:
       - "5000:5000"
     volumes:
@@ -106,6 +121,7 @@ services:
       start_period: 30s
 
   api:
+    mem_limit: 512m
     build:
       context: .
       dockerfile: docker/api.Dockerfile
@@ -125,6 +141,7 @@ services:
       - backend
 
   airflow-db:
+    mem_limit: 256m
     <<: *postgres-base
     environment:
       POSTGRES_DB: ${AIRFLOW_DB_NAME}
@@ -140,6 +157,7 @@ services:
       start_period: 10s
 
   airflow-apiserver:
+    mem_limit: 1g
     <<: *airflow-common
     command: api-server
     ports:
@@ -157,6 +175,7 @@ services:
         condition: service_completed_successfully
 
   airflow-scheduler:
+    mem_limit: 1g
     <<: *airflow-common
     command: scheduler
     healthcheck:
@@ -172,6 +191,7 @@ services:
         condition: service_completed_successfully
 
   airflow-dag-processor:
+    mem_limit: 768m
     <<: *airflow-common
     command: dag-processor
     healthcheck:
@@ -186,22 +206,8 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
-  airflow-triggerer:
-    <<: *airflow-common
-    command: triggerer
-    healthcheck:
-      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
   airflow-init:
+    mem_limit: 1g
     <<: *airflow-common
     entrypoint: /bin/bash
     # yamllint disable rule:line-length
