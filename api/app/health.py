@@ -29,7 +29,7 @@ class HealthMonitor:
         self._settings = settings
         self._engine = engine
         self._client = client
-        self._results = {"database": CheckResult(), "mlflow": CheckResult()}
+        self._results = {"database": CheckResult(), "mlflow": CheckResult(), "airflow": CheckResult()}
 
     async def run(self) -> None:
         while True:
@@ -37,9 +37,10 @@ class HealthMonitor:
             await asyncio.sleep(self._settings.health_check_interval)
 
     async def check_once(self) -> None:
-        db, mlflow = await asyncio.gather(self._check_database(), self._check_mlflow())
+        db, mlflow, airflow = await asyncio.gather(self._check_database(), self._check_mlflow(), self._check_airflow())
         self._results["database"] = db
         self._results["mlflow"] = mlflow
+        self._results["airflow"] = airflow
 
     async def _check_database(self) -> CheckResult:
         try:
@@ -64,6 +65,22 @@ class HealthMonitor:
             return CheckResult(True, "ok", time.monotonic())
         except Exception as exc:
             logger.warning("mlflow check failed: %r", exc)
+            return CheckResult(False, type(exc).__name__, time.monotonic())
+
+    async def _check_airflow(self) -> CheckResult:
+        """`/api/v2/monitor/health` de Airflow 3 (sin autenticación): además de responder, exige que
+        el scheduler y el dag-processor reporten `healthy`; sin ellos el reentrenamiento no correría."""
+        url = self._settings.airflow_url.rstrip("/") + "/api/v2/monitor/health"
+        try:
+            resp = await self._client.get(url, timeout=self._settings.health_check_timeout)
+            resp.raise_for_status()
+            estado = resp.json()
+            for parte in ("metadatabase", "scheduler", "dag_processor"):
+                if (estado.get(parte) or {}).get("status", "healthy") != "healthy":
+                    return CheckResult(False, f"{parte}_unhealthy", time.monotonic())
+            return CheckResult(True, "ok", time.monotonic())
+        except Exception as exc:
+            logger.warning("airflow check failed: %r", exc)
             return CheckResult(False, type(exc).__name__, time.monotonic())
 
     def snapshot(self) -> dict[str, dict]:

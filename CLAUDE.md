@@ -66,7 +66,7 @@ Volúmenes con nombre: `app-db-data`, `mlflow-db-data`, `mlflow-artifacts`, `air
 - [x] Paso 4: esquema de BD (`app/db/`), persistencia por transacción, observaciones idempotentes (upsert en la BD), vista `ventas_para_entrenamiento`, carga de CSV por `init`. Si app-db cae, las predicciones/observaciones responden **503** (DECISIONES.md D6).
 - [x] Paso 5: `ml/` (features únicas, baseline seasonal naive, LightGBM global, newsvendor, métricas), experimento `novamercado-pronostico`, modelo `novamercado-ventas@champion` y conexión a la API (carga al arrancar; sondeo = paso 7). Entrenar: `docker compose run --rm init python -m ml.entrenar`.
 - [x] Paso 6: DAG `reentrenar_modelo` (`dags/`), lógica en `ml/reentrenamiento.py` y criterio de promoción en `ml/promocion.py` (costo de negocio con margen de 1,5 %, DECISIONES.md D14), endpoints `/admin/reentrenar` (`api/app/rutas_admin.py`, `airflow_client.py`, tabla `reentrenamientos`). Pruebas unitarias escritas; **falta verificarlo de extremo a extremo con el compose levantado** (promoción, rechazo, fallo y límite de 10 min).
-- [ ] Paso 7: recarga del modelo sin reinicio, resiliencia ante la caída de MLflow.
+- [x] Paso 7: sondeo del alias cada 30 s y recarga en caliente (`api/app/recarga.py`, D15); si MLflow cae se conserva el modelo en memoria; `/health` alineado con el contrato (`estado`/`degradado`/503 sin modelo) y con chequeo de Airflow. Pruebas unitarias escritas; **falta verificarlo con el compose levantado** (adopción ≤ 2 min, `degradado` < 1 min, regreso a `ok` < 2 min).
 - [ ] Paso 8: arranque automático desde cero (contenedor `init`, idempotente).
 - [ ] Paso 9: README, DECISIONES.md, evidencia y tag `entrega-lab2`.
 
@@ -160,7 +160,7 @@ curl -s localhost:8080/api/v2/dags/<dag_id>/dagRuns/<dag_run_id> -H "Authorizati
 - Validación SIEMPRE temporal: entrenamiento → calibración (56 d) → prueba (56 d). `entrenar(datos, fecha_corte)`; los factores newsvendor se recalculan en cada entrenamiento y viajan dentro del modelo (D11, D12).
 - `ml/` se copia a la imagen de la API (`docker/api.Dockerfile`); la imagen de Airflow también la incluye (`COPY ml`, `PYTHONPATH=/opt/airflow`). Versiones de `mlflow`/`pandas`/`lightgbm` iguales en `api`, `mlflow` y Airflow (en la API se usa `mlflow-skinny`).
 - `python scripts/explorar_modelos.py` reproduce las comparaciones de DECISIONES.md D11/D12.
-- Tras entrenar o reentrenar hay que **reiniciar la API** para que cargue el `champion` (hasta el paso 7).
+- La API adopta un `champion` nuevo sola (sondeo cada 30 s, paso 7); no hace falta reiniciarla tras entrenar o reentrenar. Si arrancó sin modelo, también lo carga el sondeo.
 
 ## Reentrenamiento (paso 6)
 
@@ -184,7 +184,6 @@ curl -s localhost:8080/api/v2/dags/<dag_id>/dagRuns/<dag_run_id> -H "Authorizati
 - `_AIRFLOW_WWW_USER_CREATE` se ignora con SimpleAuthManager → usar el FAB auth manager para tener un usuario y contraseña fijos.
 - No usar `_PIP_ADDITIONAL_REQUIREMENTS` en Airflow: instalar los paquetes en la imagen propia (`docker/airflow.Dockerfile`).
 - WSL: el proyecto va en el sistema de archivos de Linux (`~/...`), no en `/mnt/c`. Finales de línea LF (`.gitattributes` con `* text=auto eol=lf`); un `.sh` con CRLF falla dentro del contenedor.
-- `GET /health` hoy responde `status`/`unavailable` y devuelve 503 si la BD falla; el contrato pide `estado`/`degradado` (200). Pendiente de alinear (paso 7).
 - `.env` debe incluir `AIRFLOW_UID` (salida de `id -u`, normalmente 1000) para los permisos de los logs.
 
 ## Convenciones
