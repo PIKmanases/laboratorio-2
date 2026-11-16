@@ -89,6 +89,56 @@ Comparte con predicción las filas de tienda (E01), familia (E02), fecha (E04), 
 - **Rutas de los campos:** las observaciones usan la ruta del campo (`familias[3].familia_id`) para ubicar el problema.
 - **Pendiente (Paso 4):** idempotencia (E09) y validar contra el histórico existente (p. ej. una observación muy distinta a las anteriores).
 
-## D4. Predictor falso del Paso 3
+## D4. Predictor falso del Paso 3 (actualizado en el Paso 4)
 
-Hasta el Paso 5, `POST /v1/prediccion` usa `PredictorPromedio`: promedio histórico de (tienda, familia) en fechas **anteriores** a la pedida, `version_modelo = "0"` y `cantidad_sugerida = round(venta_esperada)` (provisional; el Paso 5 lo reemplaza por el cuantil *newsvendor*). Sin historia previa devuelve `0.0`. Se carga desde `historico_ventas.csv`, montado en `/data` (solo lectura) y no incluido en la imagen. `/health` sigue en 503 porque el predictor falso no cuenta como modelo.
+Hasta el Paso 5, `POST /v1/prediccion` usa un predictor falso: promedio de las ventas de (tienda, familia) en fechas **estrictamente anteriores** a la pedida (sin fuga), `version_modelo = "0"` y `cantidad_sugerida = round(venta_esperada)` (provisional; el Paso 5 lo reemplaza por el cuantil *newsvendor*). Sin historia previa devuelve `0.0`.
+
+Desde el Paso 4 lo calcula `PredictorSQL` sobre la vista `ventas_para_entrenamiento` (histórico **y** observaciones recibidas); `PredictorPromedio` (en memoria) queda solo para las pruebas. `/health` sigue en 503 porque el predictor falso no cuenta como modelo.
+
+## D5. Esquema de app-db y creación con `create_all` (Paso 4)
+
+| Grupo | Tabla | Contenido / decisión |
+|---|---|---|
+| a) Referencia | `tiendas`, `familias`, `costos`, `feriados`, `ventas_historicas` | Se cargan una vez desde los CSV. PK de `ventas_historicas` = (tienda, familia, fecha), con FK a tiendas y familias. `costos` es por familia. |
+| b) Operación | `solicitudes` | Cada solicitud **aceptada** (predicción u observación): `tipo`, `cuerpo_crudo` (JSONB, tal como llegó), `estado_calidad`, `version_modelo` / `registros_guardados`. **Sin** unicidad por (tienda, fecha): una tienda puede pedir varias veces. |
+| | `solicitudes_rechazadas` | Cada 422: endpoint, cuerpo crudo, campo y motivo. **Tabla aparte, sin FK a tiendas**, porque la tienda puede ser justo lo inválido. Incluye errores de estructura de Pydantic. |
+| | `correcciones` | Una fila por observación de `calidad` (campo, acción, detalle), ligada a su solicitud. |
+| | `predicciones` | Una fila por familia: `venta_esperada`, `cantidad_sugerida`, `version_modelo` y la `en_promocion` declarada. Copia `tienda_id` y `fecha` de la solicitud (denormalización deliberada) para indexar la consulta de promociones sin join. |
+| | `observaciones` | Ventas reales. **PK (tienda, familia, fecha)**: es lo que permite el upsert. `valido` (por omisión `true`) permite excluir un registro del entrenamiento sin borrarlo; el upsert nunca lo modifica. |
+| c) Control | `reentrenamientos` | Una fila por ejecución del DAG (`dag_run_id`, estado, `promovido`, versiones, motivo, métricas). La usa el Paso 6; hoy está vacía. |
+| | `estado_sistema` | Clave-valor. Hoy: `carga_inicial = completada`. |
+
+**`create_all`.** Las tablas se declaran con SQLAlchemy (`app/db/modelos.py`) y se crean con `Base.metadata.create_all()` más dos `CREATE OR REPLACE VIEW` (`app/db/esquema.py`). Es idempotente, pero **no altera tablas que ya existen**: si cambia una columna hay que reiniciar con `docker compose down -v` (aceptable en el laboratorio; en producción se usaría Alembic). Solo lo ejecuta el contenedor `init` (un único dueño del esquema, sin carreras): la API depende de `init` con `service_completed_successfully` y no crea tablas. *Alternativas descartadas:* SQL a mano en un `.sql` montado en `docker-entrypoint-initdb.d` (solo corre con el volumen vacío y duplica el esquema); Alembic (migraciones sin necesidad todavía).
+
+**Vista `ventas_para_entrenamiento`** (insumo único para el Paso 5 y el 6): histórico + `observaciones` con `valido = true`, sin duplicar días.
+- Si un día está en el histórico y también observado, **manda la observación**.
+- **Promociones:** las observaciones no traen `en_promocion`. Se toma de la **última** predicción pedida para (tienda, familia, fecha) (vista `promocion_solicitada`; si la tienda pidió varias veces vale la de mayor `id`). Si ese día **no hubo solicitud**, no se conoce la promoción: se usa la del histórico si el día lo reemplaza y, si tampoco, **se supone 0**. La columna `promocion_conocida` queda en `false` en ese caso, para que el modelo pueda filtrar o ponderar esas filas. *Riesgo conocido:* si una tienda observa muchos días sin haber pedido pronóstico, el modelo aprende «sin promoción» con ventas que sí tuvieron promoción.
+- La columna `origen` (`historico` / `observacion`) permite auditar.
+
+## D6. Si app-db no responde: 503 (Paso 4)
+
+Se elige **responder 503** en `POST /v1/prediccion` y `POST /v1/observaciones` (no predecir sin registrar).
+
+| Opción | Por qué se descartó / eligió |
+|---|---|
+| Responder la predicción sin registrarla y marcar `/health` degradado | Descartada. El producto exige un registro de cada solicitud: una predicción sin registro no se puede auditar ni usar luego como promoción del día. Además el predictor lee el histórico y las ventas recientes de app-db: sin ella no se puede predecir bien (con el modelo real del Paso 5, peor), y habría que inventar un modo degradado con datos viejos. |
+| **503 con `{"detail": ...}`** | Elegida. Es honesto, el cliente puede reintentar, y nunca queda una respuesta sin registro. |
+
+Detalles: los **rechazos 422 siguen siendo 422** aunque app-db esté caída (el rechazo se registra «a mejor esfuerzo»; no se necesita la base para saber que el dato es inválido). `/health` ya reporta la base (chequeo en segundo plano) y la API se recupera sola cuando vuelve (probado: `docker compose stop app-db` → 503; `start` → 200). Con la base caída el 503 tarda unos segundos (timeout de conexión de 3 s). El modelo en memoria del Paso 7 NO cambia esto: a MLflow nunca se le contacta dentro de una predicción, pero app-db sí es parte del camino.
+
+## D7. Transacciones e idempotencia (Paso 4)
+
+- **Una transacción por solicitud** (`engine.begin()`): solicitud + correcciones + predicciones (o + upsert de observaciones) se guardan juntas o no se guarda nada. Probado con una violación de FK a mitad: no queda solicitud huérfana.
+- **Upsert hecho por la BD:** `INSERT ... ON CONFLICT (tienda, familia, fecha) DO UPDATE SET ventas = EXCLUDED.ventas ... WHERE observaciones.ventas IS DISTINCT FROM EXCLUDED.ventas RETURNING ...`. El `WHERE` descarta las filas idénticas y `RETURNING` solo devuelve las insertadas o modificadas, así que `registros_guardados` = filas realmente nuevas o cambiadas, sin leer antes ni comparar en Python, y es seguro ante envíos concurrentes. Reenviar lo idéntico devuelve 0.
+- **Cada envío queda en `solicitudes`** aunque no cambie nada (auditoría); `observaciones.solicitud_id` apunta a la última que la creó o modificó.
+- Los registros omitidos por la limpieza (E08) **no** se guardan en `observaciones`; queda constancia en `correcciones` y en el `cuerpo_crudo`.
+- El cuerpo crudo se sanea antes de guardarlo (JSONB rechaza `NaN` y `\u0000`).
+- `recibida_en` usa el reloj de la BD solo para auditoría; nunca para validar fechas.
+
+## D8. Carga inicial de los CSV (Paso 4)
+
+Contenedor `init` (misma imagen de la API, `python -m app.db.carga`, `./data:/data:ro`; los datos no van en la imagen y la API ya no monta `data/`).
+- **Idempotente:** si `ventas_historicas` tiene filas no hace nada (y se asegura `carga_inicial = completada`). Tras `down` + `up` (sin `-v`) no se vuelve a cargar.
+- **Atómica:** todo en una transacción; si un CSV falla no queda nada a medias ni la bandera.
+- **Normalización de IDs:** `familia_id` y `tienda_id` pasan por las mismas funciones de la limpieza (`a_familia`, `a_tienda`, `normalizar_texto`), de modo que coinciden exactamente con lo que usa la API. Un ID que no se resuelve **aborta** la carga (no se descarta en silencio).
+- `ON CONFLICT DO NOTHING` en las tablas de referencia; carga por lotes de 5000 filas.

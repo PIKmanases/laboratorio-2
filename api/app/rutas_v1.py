@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Request
 
+from .db.repositorio import ErrorPersistencia
 from .esquemas import (
     Calidad as CalidadRespuesta,
     EntradaObservacion,
@@ -9,7 +10,7 @@ from .esquemas import (
     RespuestaObservaciones,
     RespuestaPrediccion,
 )
-from .limpieza import Calidad, limpiar_observacion, limpiar_prediccion
+from .limpieza import Calidad, SolicitudRechazada, limpiar_observacion, limpiar_prediccion
 
 router = APIRouter(prefix="/v1")
 
@@ -21,16 +22,29 @@ def _a_respuesta(calidad: Calidad) -> CalidadRespuesta:
     )
 
 
+def _registrar_rechazo(repo, endpoint: str, crudo, e: SolicitudRechazada) -> None:
+    """El rechazo se guarda 'a mejor esfuerzo': si app-db falla igual se responde el 422."""
+    try:
+        repo.guardar_rechazo(endpoint, crudo, e.campo, e.motivo)
+    except ErrorPersistencia:
+        pass
+
+
 @router.post("/prediccion", response_model=RespuestaPrediccion)
 def prediccion(entrada: EntradaPrediccion, request: Request) -> RespuestaPrediccion:
-    limpia = limpiar_prediccion(entrada, request.app.state.catalogos)  # SolicitudRechazada -> 422
+    estado = request.app.state
+    crudo = entrada.model_dump(exclude_unset=True)
+    try:
+        limpia = limpiar_prediccion(entrada, estado.catalogos)
+    except SolicitudRechazada as e:
+        _registrar_rechazo(estado.repositorio, "prediccion", crudo, e)
+        raise
     s = limpia.solicitud
-    predictor = request.app.state.predictor
-    esperadas = predictor.predecir(s.tienda_id, s.fecha, s.familias)
-    return RespuestaPrediccion(
+    esperadas = estado.predictor.predecir(s.tienda_id, s.fecha, s.familias)  # puede dar 503
+    respuesta = RespuestaPrediccion(
         tienda_id=s.tienda_id,
         fecha=s.fecha,
-        version_modelo=predictor.version,
+        version_modelo=estado.predictor.version,
         predicciones=[
             PrediccionFamilia(
                 familia_id=f.familia_id,
@@ -42,10 +56,20 @@ def prediccion(entrada: EntradaPrediccion, request: Request) -> RespuestaPredicc
         ],
         calidad=_a_respuesta(limpia.calidad),
     )
+    # Una transacción: solicitud + correcciones + predicciones. Si falla -> 503 y no se
+    # responde una predicción que no quedó registrada.
+    estado.repositorio.guardar_prediccion(s, limpia.calidad, crudo, respuesta)
+    return respuesta
 
 
 @router.post("/observaciones", response_model=RespuestaObservaciones)
 def observaciones(entrada: EntradaObservacion, request: Request) -> RespuestaObservaciones:
-    limpia = limpiar_observacion(entrada, request.app.state.catalogos)
-    # Paso 4: aquí irá el upsert idempotente. Todavía no hay base de datos.
-    return RespuestaObservaciones(registros_guardados=0, calidad=_a_respuesta(limpia.calidad))
+    estado = request.app.state
+    crudo = entrada.model_dump(exclude_unset=True)
+    try:
+        limpia = limpiar_observacion(entrada, estado.catalogos)
+    except SolicitudRechazada as e:
+        _registrar_rechazo(estado.repositorio, "observaciones", crudo, e)
+        raise
+    guardados = estado.repositorio.guardar_observacion(limpia.solicitud, limpia.calidad, crudo)
+    return RespuestaObservaciones(registros_guardados=guardados, calidad=_a_respuesta(limpia.calidad))

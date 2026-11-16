@@ -1,12 +1,10 @@
-"""Predictor falso (hasta el paso 5): promedio histórico por tienda y familia."""
+"""Predictor falso en memoria (pruebas). El de producción es `db.repositorio.PredictorSQL`."""
 
-import csv
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import date
 from itertools import accumulate
-from pathlib import Path
 from typing import Protocol
 
 from .esquemas import FamiliaSolicitada
@@ -38,15 +36,6 @@ class PredictorPromedio:
             valores.sort()
             self._fechas[clave] = [f for f, _ in valores]
             self._acumulado[clave] = list(accumulate(v for _, v in valores))
-
-    @classmethod
-    def desde_csv(cls, ruta: Path) -> "PredictorPromedio":
-        with open(ruta, newline="", encoding="utf-8") as f:
-            filas = (
-                (date.fromisoformat(r["fecha"]), int(r["tienda_id"]), r["familia_id"], float(r["ventas"]))
-                for r in csv.DictReader(f)
-            )
-            return cls(filas)
 
     def predecir(self, tienda_id: int, fecha: date, familias: Sequence[FamiliaSolicitada]) -> dict[str, float]:
         resultado = {}

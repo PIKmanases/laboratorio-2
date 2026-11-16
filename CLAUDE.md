@@ -31,10 +31,10 @@ el porqué, señala las alternativas y no introduzcas dependencias o complejidad
 | `airflow-dag-processor` | Airflow 3.x | — | Analiza `dags/` (servicio obligatorio en Airflow 3). |
 | `airflow-init` | Airflow 3.x (una sola vez) | — | Migra la BD de Airflow y crea el usuario admin. |
 | `airflow-db` | PostgreSQL 17 | 5432 (interno) | BD de Airflow. **Separada de `app-db`** (requisito). |
-| `init` (pendiente) | Imagen de API/ML (una sola vez) | — | Arranque desde cero: crea tablas, carga CSV y entrena y registra el primer modelo. |
+| `init` | Imagen de API/ML (una sola vez) | — | Arranque desde cero: crea tablas (`create_all`) y carga los CSV (idempotente, monta `./data:/data:ro`). **Pendiente (paso 8):** entrenar y registrar el primer modelo. |
 
 Conexiones dentro de la red de compose:
-- `api` → `app-db` (persistencia y features recientes), `mlflow` (sondea el alias del modelo vigente), `airflow-apiserver` (dispara y consulta el DAG).
+- `api` → `app-db` (persistencia, catálogos y features recientes; arranca después de `init`), `mlflow` (sondea el alias del modelo vigente), `airflow-apiserver` (dispara y consulta el DAG).
 - Los servicios de Airflow → `app-db` (datos para entrenar) y `mlflow` (registro y promoción).
 - `mlflow` sirve los artefactos por HTTP (`--serve-artifacts`, volumen `mlflow-artifacts`), así que ningún otro contenedor monta ese volumen.
 
@@ -63,7 +63,7 @@ Volúmenes con nombre: `app-db-data`, `mlflow-db-data`, `mlflow-artifacts`, `air
 - [x] Paso 2a: `app-db`, `mlflow-db`, `mlflow` y `api` con `GET /health` (monitor en segundo plano). `/health` responde 503 porque todavía no hay modelo; es el comportamiento esperado.
 - [ ] Paso 2b: Airflow 3 (apiserver, scheduler, dag-processor, init, airflow-db) + DAG de prueba disparado por la API REST + chequeo de Airflow en `/health`.
 - [x] Paso 3: contrato con Pydantic + capa de limpieza con pruebas.
-- [ ] Paso 4: esquema de BD y persistencia (observaciones idempotentes).
+- [x] Paso 4: esquema de BD (`app/db/`), persistencia por transacción, observaciones idempotentes (upsert en la BD), vista `ventas_para_entrenamiento`, carga de CSV por `init`. Si app-db cae, las predicciones/observaciones responden **503** (DECISIONES.md D6).
 - [ ] Paso 5: baseline + modelo de ML, métrica de costo y registro en MLflow con alias.
 - [ ] Paso 6: DAG de reentrenamiento + criterio de promoción.
 - [ ] Paso 7: recarga del modelo sin reinicio, resiliencia ante la caída de MLflow.
@@ -141,6 +141,18 @@ curl -s -X POST localhost:8080/api/v2/dags/<dag_id>/dagRuns -H "Authorization: B
 curl -s localhost:8080/api/v2/dags/<dag_id>/dagRuns/<dag_run_id> -H "Authorization: Bearer $TOKEN"
 ```
 
+## Persistencia (paso 4)
+
+- Código en `api/app/db/`: `modelos.py` (tablas), `esquema.py` (`crear_esquema`: `create_all` + vistas), `repositorio.py` (`RepositorioSQL`, `PredictorSQL`, `ErrorPersistencia`), `carga.py` (`python -m app.db.carga`).
+- Tablas: referencia (`tiendas`, `familias`, `costos`, `feriados`, `ventas_historicas`), operación (`solicitudes`, `solicitudes_rechazadas`, `correcciones`, `predicciones`, `observaciones`) y control (`reentrenamientos`, `estado_sistema`). Detalle en DECISIONES.md D5.
+- **`create_all` no altera tablas existentes**: si cambias una columna, `docker compose down -v`. Solo `init` crea el esquema; la API no.
+- **Datos de entrenamiento = vista `ventas_para_entrenamiento`** (histórico + observaciones válidas). Las promociones de días observados salen de la última predicción pedida; sin solicitud se supone 0 y `promocion_conocida = false`.
+- Los repositorios/predictores se inyectan en `create_app(...)`; las pruebas unitarias usan `tests/fakes.py` (sin Postgres).
+- Pruebas contra Postgres real (`-m integracion`, se omiten sin `TEST_DATABASE_URL`; **borran las tablas de esa base**, no uses app-db):
+  `docker run -d --rm --name pg-test -e POSTGRES_PASSWORD=t -p 55432:5432 postgres:17` y
+  `TEST_DATABASE_URL=postgresql+psycopg://postgres:t@localhost:55432/postgres .venv/bin/pytest -m integracion`.
+- Entorno local: las versiones fijadas piden Python ≥ 3.11 (el del sistema es 3.10): `uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r api/requirements.txt pytest`.
+
 ## Problemas conocidos y sus soluciones
 
 - **MLflow 3.x responde 403 a otros contenedores** si no se pasa `--allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000` (valida el header Host). Comprobado.
@@ -153,6 +165,7 @@ curl -s localhost:8080/api/v2/dags/<dag_id>/dagRuns/<dag_run_id> -H "Authorizati
 - `_AIRFLOW_WWW_USER_CREATE` se ignora con SimpleAuthManager → usar el FAB auth manager para tener un usuario y contraseña fijos.
 - No usar `_PIP_ADDITIONAL_REQUIREMENTS` en Airflow: instalar los paquetes en la imagen propia (`docker/airflow.Dockerfile`).
 - WSL: el proyecto va en el sistema de archivos de Linux (`~/...`), no en `/mnt/c`. Finales de línea LF (`.gitattributes` con `* text=auto eol=lf`); un `.sh` con CRLF falla dentro del contenedor.
+- `GET /health` hoy responde `status`/`unavailable` y devuelve 503 si la BD falla; el contrato pide `estado`/`degradado` (200). Pendiente de alinear (paso 7).
 - `.env` debe incluir `AIRFLOW_UID` (salida de `id -u`, normalmente 1000) para los permisos de los logs.
 
 ## Convenciones

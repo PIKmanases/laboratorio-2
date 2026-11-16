@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.limpieza import Catalogos
 from app.main import create_app
 from app.predictor import PredictorPromedio
+from fakes import RepositorioMemoria
 
 FAMILIAS = [
     ("abarrotes", "Abarrotes"), ("bebidas", "Bebidas"), ("lacteos", "Lácteos"), ("carnes", "Carnes"),
@@ -26,10 +27,15 @@ def todas_las_familias() -> list[str]:
 
 
 @pytest.fixture
-def client(catalogos) -> TestClient:
+def repo() -> RepositorioMemoria:
+    return RepositorioMemoria()
+
+
+@pytest.fixture
+def client(catalogos, repo) -> TestClient:
     historia = [
         (date(2025, 11, 14), 5, "abarrotes", 100.0),
         (date(2025, 11, 15), 5, "abarrotes", 200.0),
         (date(2025, 11, 17), 5, "abarrotes", 9999.0),  # el día pedido: NO debe usarse
     ]
-    return TestClient(create_app(catalogos=catalogos, predictor=PredictorPromedio(historia)))
+    return TestClient(create_app(catalogos=catalogos, predictor=PredictorPromedio(historia), repositorio=repo))
