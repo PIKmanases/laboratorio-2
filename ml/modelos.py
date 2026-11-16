@@ -146,6 +146,9 @@ class Pronosticador:
         self.modelo, self.factores, self.tiendas, self.feriados, self.meta = modelo, factores, tiendas, feriados, meta or {}
 
     def predecir(self, historia: pd.DataFrame) -> pd.DataFrame:
+        desconocidas = set(historia["familia_id"]) - set(self.factores.q_familia)
+        if desconocidas:  # ni siquiera NaN en silencio: un id no canónico es un error
+            raise ValueError(f"familia_id sin factor en el modelo (¿no es el id canónico?): {sorted(desconocidas)}")
         X = construir_features(historia, self.tiendas, self.feriados)
         objetivo = historia["ventas"].isna().to_numpy()
         if not objetivo.any():
