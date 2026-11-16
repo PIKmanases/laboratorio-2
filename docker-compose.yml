@@ -120,14 +120,14 @@ services:
       retries: 5
       start_period: 30s
 
-  # Arranque desde cero (una sola vez, idempotente): crea tablas y carga los CSV a app-db.
-  # El paso 8 le añade el entrenamiento del primer modelo.
+  # Arranque desde cero (una sola vez, idempotente): crea tablas, carga los CSV a app-db y entrena
+  # el primer modelo SOLO si MLflow aún no tiene `champion`. Tras `down` + `up` (sin -v) no repite nada.
   init:
-    mem_limit: 1g  # el entrenamiento (paso 5) corre aquí con `python -m ml.entrenar`
+    mem_limit: 1g  # el entrenamiento corre aquí (`python -m ml.arranque`)
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    command: ["python", "-m", "app.db.carga"]
+    command: ["sh", "-c", "python -m app.db.carga && python -m ml.arranque"]
     restart: "no"
     environment:
       DATABASE_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
@@ -138,6 +138,9 @@ services:
       - ./data:/data:ro
     depends_on:
       app-db:
+        condition: service_healthy
+      # El entrenamiento inicial registra el modelo: necesita MLflow listo (la API, en cambio, no).
+      mlflow:
         condition: service_healthy
     networks:
       - backend

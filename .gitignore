@@ -53,3 +53,6 @@ Thumbs.db
 # Airflow (logs y config generada)
 airflow/logs/
 airflow/config/airflow.cfg
+
+# Datos del equipo docente (no se versionan; ver README)
+data/
