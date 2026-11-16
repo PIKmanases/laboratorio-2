@@ -50,7 +50,7 @@ Volúmenes con nombre: `app-db-data`, `mlflow-db-data`, `mlflow-artifacts`, `air
 ├── CLAUDE.md
 ├── data/                   # CSV publicados por el equipo docente (ignorado por git)
 ├── api/                    # FastAPI: app/, requirements.txt
-├── ml/                     # features, entrenamiento, métrica de costo, criterio de promoción
+├── ml/                     # features (UNA función), modelos, newsvendor, métricas, entrenar, registro MLflow (paso 6: criterio de promoción)
 ├── dags/                   # DAGs de Airflow
 ├── docker/                 # Dockerfiles (api, mlflow, airflow)
 ├── scripts/                # utilidades (p. ej. simulador/evaluador propio)
@@ -64,7 +64,7 @@ Volúmenes con nombre: `app-db-data`, `mlflow-db-data`, `mlflow-artifacts`, `air
 - [ ] Paso 2b: Airflow 3 (apiserver, scheduler, dag-processor, init, airflow-db) + DAG de prueba disparado por la API REST + chequeo de Airflow en `/health`.
 - [x] Paso 3: contrato con Pydantic + capa de limpieza con pruebas.
 - [x] Paso 4: esquema de BD (`app/db/`), persistencia por transacción, observaciones idempotentes (upsert en la BD), vista `ventas_para_entrenamiento`, carga de CSV por `init`. Si app-db cae, las predicciones/observaciones responden **503** (DECISIONES.md D6).
-- [ ] Paso 5: baseline + modelo de ML, métrica de costo y registro en MLflow con alias.
+- [x] Paso 5: `ml/` (features únicas, baseline seasonal naive, LightGBM global, newsvendor, métricas), experimento `novamercado-pronostico`, modelo `novamercado-ventas@champion` y conexión a la API (carga al arrancar; sondeo = paso 7). Entrenar: `docker compose run --rm init python -m ml.entrenar`.
 - [ ] Paso 6: DAG de reentrenamiento + criterio de promoción.
 - [ ] Paso 7: recarga del modelo sin reinicio, resiliencia ante la caída de MLflow.
 - [ ] Paso 8: arranque automático desde cero (contenedor `init`, idempotente).
@@ -151,9 +151,20 @@ curl -s localhost:8080/api/v2/dags/<dag_id>/dagRuns/<dag_run_id> -H "Authorizati
 - Pruebas contra Postgres real (`-m integracion`, se omiten sin `TEST_DATABASE_URL`; **borran las tablas de esa base**, no uses app-db):
   `docker run -d --rm --name pg-test -e POSTGRES_PASSWORD=t -p 55432:5432 postgres:17` y
   `TEST_DATABASE_URL=postgresql+psycopg://postgres:t@localhost:55432/postgres .venv/bin/pytest -m integracion`.
-- Entorno local: las versiones fijadas piden Python ≥ 3.11 (el del sistema es 3.10): `uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r api/requirements.txt pytest`.
+- Entorno local: las versiones fijadas piden Python ≥ 3.11 (el del sistema es 3.10): `uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r api/requirements.txt mlflow==3.18.0 scikit-learn==1.9.1 pytest`.
+
+## Modelo (paso 5)
+
+- `ml/features.py`: **`construir_features` es la única función de features**; la usan el entrenamiento y la API (`PredictorML`). No dupliques lógica de features en la API. Solo datos hasta D-1 + `en_promocion` de D + calendario + atributos fijos (DECISIONES.md D9).
+- Falta de historia: LightGBM maneja NaN; si una serie no tiene ventas en 28 días se usa el **plan B** (media familia × formato × día). Ver D10.
+- Validación SIEMPRE temporal: entrenamiento → calibración (56 d) → prueba (56 d). `entrenar(datos, fecha_corte)`; los factores newsvendor se recalculan en cada entrenamiento y viajan dentro del modelo (D11, D12).
+- `ml/` se copia a la imagen de la API (`docker/api.Dockerfile`); la imagen de Airflow debe incluirla en el paso 6. Versiones de `mlflow`/`pandas`/`lightgbm` iguales en `api`, `mlflow` y Airflow (en la API se usa `mlflow-skinny`).
+- `python scripts/explorar_modelos.py` reproduce las comparaciones de DECISIONES.md D11/D12.
+- Tras entrenar hay que **reiniciar la API** para que cargue el `champion` (hasta el paso 7).
 
 ## Problemas conocidos y sus soluciones
+- **El servicio `mlflow` necesita ~1,5 GB** (con 768 MB lo mata el OOM-killer al registrar modelos: «server process exited with code -9»). `docker inspect -f '{{.State.OOMKilled}}' <contenedor>` lo confirma.
+- `docker compose build api` **no** reconstruye `init` (imagen propia con el mismo Dockerfile): usa `docker compose build api init`.
 
 - **MLflow 3.x responde 403 a otros contenedores** si no se pasa `--allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000` (valida el header Host). Comprobado.
 - En el compose, `api` depende de `mlflow` con `condition: service_started`, **no** `service_healthy`: la API debe arrancar aunque MLflow esté caído.

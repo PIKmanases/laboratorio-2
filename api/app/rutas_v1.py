@@ -40,19 +40,16 @@ def prediccion(entrada: EntradaPrediccion, request: Request) -> RespuestaPredicc
         _registrar_rechazo(estado.repositorio, "prediccion", crudo, e)
         raise
     s = limpia.solicitud
-    esperadas = estado.predictor.predecir(s.tienda_id, s.fecha, s.familias)  # puede dar 503
+    resultado = estado.predictor.predecir(s.tienda_id, s.fecha, s.familias)  # puede dar 503
     respuesta = RespuestaPrediccion(
         tienda_id=s.tienda_id,
         fecha=s.fecha,
-        version_modelo=estado.predictor.version,
+        version_modelo=resultado.version,
         predicciones=[
             PrediccionFamilia(
-                familia_id=f.familia_id,
-                venta_esperada=esperadas[f.familia_id],
-                # Provisional: el paso 5 lo reemplaza por el cuantil newsvendor.
-                cantidad_sugerida=max(0, round(esperadas[f.familia_id])),
+                familia_id=p.familia_id, venta_esperada=p.venta_esperada, cantidad_sugerida=p.cantidad_sugerida
             )
-            for f in s.familias
+            for p in resultado.pronosticos
         ],
         calidad=_a_respuesta(limpia.calidad),
     )

@@ -89,11 +89,9 @@ Comparte con predicción las filas de tienda (E01), familia (E02), fecha (E04), 
 - **Rutas de los campos:** las observaciones usan la ruta del campo (`familias[3].familia_id`) para ubicar el problema.
 - **Pendiente (Paso 4):** idempotencia (E09) y validar contra el histórico existente (p. ej. una observación muy distinta a las anteriores).
 
-## D4. Predictor falso del Paso 3 (actualizado en el Paso 4)
+## D4. Predictor (actualizado en el Paso 5)
 
-Hasta el Paso 5, `POST /v1/prediccion` usa un predictor falso: promedio de las ventas de (tienda, familia) en fechas **estrictamente anteriores** a la pedida (sin fuga), `version_modelo = "0"` y `cantidad_sugerida = round(venta_esperada)` (provisional; el Paso 5 lo reemplaza por el cuantil *newsvendor*). Sin historia previa devuelve `0.0`.
-
-Desde el Paso 4 lo calcula `PredictorSQL` sobre la vista `ventas_para_entrenamiento` (histórico **y** observaciones recibidas); `PredictorPromedio` (en memoria) queda solo para las pruebas. `/health` sigue en 503 porque el predictor falso no cuenta como modelo.
+Pasos 3–4: predictor falso (promedio histórico, `version_modelo = "0"`). **Desde el Paso 5** lo reemplaza `PredictorML` (`app/predictor.py`): lee la historia reciente de app-db, agrega las filas a pronosticar y llama al modelo cargado en memoria. El predictor falso solo sobrevive en `tests/fakes.py`. Sin modelo cargado, `POST /v1/prediccion` y `GET /modelo` responden **503** (igual que `/health`).
 
 ## D5. Esquema de app-db y creación con `create_all` (Paso 4)
 
@@ -142,3 +140,109 @@ Contenedor `init` (misma imagen de la API, `python -m app.db.carga`, `./data:/da
 - **Atómica:** todo en una transacción; si un CSV falla no queda nada a medias ni la bandera.
 - **Normalización de IDs:** `familia_id` y `tienda_id` pasan por las mismas funciones de la limpieza (`a_familia`, `a_tienda`, `normalizar_texto`), de modo que coinciden exactamente con lo que usa la API. Un ID que no se resuelve **aborta** la carga (no se descarta en silencio).
 - `ON CONFLICT DO NOTHING` en las tablas de referencia; carga por lotes de 5000 filas.
+
+## D9. Qué información existe al predecir y qué features usa el modelo (Paso 5)
+
+**Regla de información.** Al predecir el día D la API solo dispone de:
+1. las **ventas reales hasta D-1** (la observación de ayer llega antes que la solicitud de hoy);
+2. la **`en_promocion` del día D**, que viene en la solicitud (las observaciones no traen promoción);
+3. el **calendario de D** (día de la semana, feriados, fechas comerciales y de pago): `feriados.csv` cubre fechas futuras;
+4. los **atributos fijos** de tienda y familia.
+
+Nunca se usa nada de D ni posterior. Se garantiza por construcción: toda feature derivada de ventas pasa por `shift(≥1)` sobre un **calendario diario completo** (un día sin dato queda en NaN en vez de «correrse»), y la API lee de la vista solo `fecha < D` (`ml.datos.historia_reciente`). Hay pruebas que alteran las ventas de D y posteriores y comprueban que las features de D no cambian, y que las features que arma la API son idénticas a las del entrenamiento.
+
+**Una sola función**, `ml.features.construir_features(historia, tiendas, feriados)`: recibe un DataFrame con la historia y devuelve las features de cada fila. El entrenamiento la aplica a toda la vista `ventas_para_entrenamiento` (cada fila es «el día D» de su propia fila); la API le pasa la historia de los últimos 60 días + una fila por familia pedida con `ventas = NaN` y la promoción de la solicitud. Mismo código, sin riesgo de *training/serving skew* por reimplementar.
+
+| Grupo | Features (29) |
+|---|---|
+| Calendario | `dia_semana`, `dia_mes`, `mes`, `semana_anio`, `es_fin_de_semana`, `es_feriado_nacional`, `es_feriado_local` (ámbito = ciudad de la tienda), `es_medio_dia`, `es_comercial`, `es_pago`, `es_vispera_feriado`, `es_dia_post_feriado` |
+| Promoción | `en_promocion` del día D |
+| Historia de la serie (tienda × familia) | `lag_1`, `lag_7`, `lag_14`, `lag_21`, `lag_28`, `media_mismo_dia_4`, `media_7`, `media_28`, `std_28`, `ratio_7_28`, `n_obs_28` (cuántos días con dato en los últimos 28) |
+| Atributos fijos | `tienda_id`, `familia_id`, `tipo` (formato), `ciudad`, `departamento` |
+
+**Otras features consideradas** (ablación en D10): la **historia de promoción** (`promo_lag_1/7`, `promo_media_7`) y la **promoción total de la tienda ese día** no mejoraron nada (WAPE 18,1 % y 18,0 % frente a 18,0 %); además la primera es peligrosa: en días observados sin solicitud la promoción es un supuesto (D5), y la segunda depende de que la solicitud traiga todas las familias. `dias_a_fin_de_mes` tampoco aportó (el árbol ya ve `dia_mes`). Se **descartaron** las tres. Quitar el calendario sí empeora (WAPE 20,0 %).
+
+**Limitaciones.** Hay solo 2 años de datos: no se usa «mismo día del año pasado». Si una fecha cae fuera de lo que cubre `feriados.csv`, el calendario queda sin feriados (silenciosamente). En este conjunto el nivel de cada serie es estable, así que quitar toda la historia de ventas casi no cambia el error (WAPE 18,1 %, sesgo −6,5 %); se conserva porque es lo que permite adaptarse a un cambio de nivel real y porque lo pide el enunciado.
+
+## D10. Falta de historia: plan B (Paso 5)
+
+Puede faltar historia por: una observación que no llegó, un día excluido por inválido (E08: registro omitido o `valido = false`; la vista no lo incluye) o una combinación tienda-familia sin datos.
+
+| Situación | Qué pasa |
+|---|---|
+| Faltan algunos días | Ese lag es NaN. **LightGBM maneja los NaN de forma nativa** (el entrenamiento incluye filas con huecos: las primeras semanas de cada serie). Los promedios (`media_7`, `media_28`, `media_mismo_dia_4`) ignoran los días ausentes (mínimo 3 / 7 / 1 datos). |
+| **Ningún** dato en los últimos 28 días (`n_obs_28 = 0`) | El árbol nunca vio ese caso: se usa el **plan B** en lugar de LightGBM. |
+| **Baseline** sin sus 4 mismos días | Usa el plan B. |
+
+**Plan B** (`ml.modelos.PlanB`): media de las ventas de los últimos 90 días de entrenamiento por **(familia, formato de tienda, día de la semana)**; si esa celda no existe, **(familia, formato)**; si no, **familia**; si ni la familia existe, 0. Viaja dentro del modelo. *Alternativa descartada:* el promedio global por familia (ignora que un express vende cinco veces menos que un hipermercado).
+
+## D11. Validación temporal, baseline y modelo de ML (Paso 5)
+
+**Validación: siempre temporal, nunca al azar** (con datos autocorrelacionados, mezclar días filtra el futuro y el error sale falsamente bajo). `ml.entrenar.entrenar(datos, fecha_corte)` usa tres bloques consecutivos:
+
+```
+|------------ entrenamiento ------------|-- calibración (56 d) --|----- prueba (56 d) -----|
+                                  fecha_corte                                              fin
+```
+El modelo se ajusta con `fecha < fecha_corte`; la calibración sirve para los factores del newsvendor (D12); **todas las métricas se miden en la prueba**, con factores que no vieron esos días. Es predicción a 1 día con la historia real al día anterior, que es lo que hace la API. El modelo publicado se **reajusta con todos los datos** (con más historia reciente) y sus factores salen de los errores out-of-sample de calibración + prueba; por tanto las métricas describen al modelo del corte, no exactamente al reajustado (es el compromiso habitual).
+
+**Baseline elegido: seasonal naive con media de los últimos 4 mismos días de la semana** (D-7, D-14, D-21, D-28), con plan B si faltan. Es fácil de explicar, sin entrenamiento y robusto al ruido de un solo día. Frente a las alternativas (tabla siguiente) es claramente mejor que D-7 solo (WAPE 22,1 % vs 27,4 %) y que la media por familia × formato × día (24,0 %).
+
+**Modelo de ML: LightGBM global** (un solo modelo para las 120 series; la identidad de tienda y familia entra como categorías; objetivo Tweedie 1,2, 31 hojas, 600 rondas, lr 0,05; semilla fija). Un modelo global comparte la estructura (día de la semana, promoción, feriados) entre series y arranca bien con series cortas; 120 modelos locales tendrían 700 puntos cada uno. Alternativas probadas (en un protocolo **desplazado 112 días atrás** para no afinar sobre la prueba final; 6 720 filas de prueba; reproducible con `python scripts/explorar_modelos.py`):
+
+| Modelo | MAE | RMSE | WAPE | Sesgo rel. | Costo total* |
+|---|---|---|---|---|---|
+| Baseline: media 4 mismos días + plan B | 45,5 | 83,9 | 22,1 % | −0,5 % | 214 226 |
+| Baseline: solo D-7 + plan B | 56,4 | 105,1 | 27,4 % | −0,2 % | 269 138 |
+| Solo plan B (familia × formato × día) | 49,4 | 94,6 | 24,0 % | +0,4 % | 224 885 |
+| **LightGBM Tweedie 1,2 · 31 hojas · 600 rondas (elegido)** | **37,1** | 69,2 | **18,0 %** | −2,0 % | 176 080 |
+| LightGBM L2 | 38,2 | 69,8 | 18,5 % | −0,9 % | 180 294 |
+| LightGBM L2 sobre log1p(ventas) | 37,5 | 69,4 | 18,2 % | −4,2 % | 177 235 |
+| LightGBM Poisson | 37,4 | 68,4 | 18,2 % | −1,2 % | 177 286 |
+| LightGBM Tweedie, 15 hojas | 37,3 | 68,7 | 18,1 % | −1,2 % | 176 326 |
+| LightGBM Tweedie, 63 hojas | 37,3 | 69,8 | 18,1 % | −2,5 % | 176 542 |
+| LightGBM Tweedie, 300 rondas | 37,4 | 69,0 | 18,2 % | −1,4 % | 178 079 |
+| LightGBM Tweedie, 1200 rondas, lr 0,025 | 37,1 | 68,5 | 18,0 % | −1,8 % | 176 109 |
+| *Ablación:* sin calendario | 41,2 | 75,6 | 20,0 % | −0,2 % | 195 220 |
+| *Ablación:* sin historia de ventas | 37,3 | 70,1 | 18,1 % | −6,5 % | 172 156 |
+| *Ablación:* sin atributos fijos (formato/ciudad/depto.) | 37,5 | 69,4 | 18,2 % | −2,0 % | 177 640 |
+| *Candidata:* + historia de promoción | 37,3 | 69,3 | 18,1 % | −1,7 % | 176 371 |
+| *Candidata:* + promoción total de la tienda | 37,1 | 68,9 | 18,0 % | −1,9 % | 175 876 |
+| *Candidata:* + días al fin de mes | 37,2 | 69,0 | 18,1 % | −1,9 % | 176 087 |
+
+\* Costo con la regla de cuantiles de D12 (calibrada en la calibración de ese protocolo). Las diferencias entre variantes de LightGBM (objetivo, hojas, rondas) están dentro del ruido (≤ 1 % en WAPE): se dejó la configuración simple. LightGBM mejora al baseline ≈ 4 puntos de WAPE y ≈ 18 % de costo. Las features más importantes por ganancia son las medias recientes (`media_7`, `media_mismo_dia_4`, `lag_1`, `media_28`); el calendario aporta lo que no está en la historia (feriados, medio día, fines de semana).
+
+## D12. Cantidad sugerida: newsvendor (Paso 5)
+
+`venta_esperada` es el centro de la distribución; `cantidad_sugerida` es cuánto conviene tener. Con costo de faltante `cf` y de sobrante `cs`, la cantidad óptima es el **cuantil τ = cf / (cf + cs)** de la demanda: si faltar cuesta 2 y sobrar 0,1 (licores, τ = 0,95) conviene cubrir el 95 % de los días; si sobrar cuesta 2,5 y faltar 1 (panadería, τ = 0,29) conviene quedarse corto.
+
+**Método del cuantil.** No se supone una distribución: se usan los **errores relativos out-of-sample** del modelo, `r = (real − esperada) / max(esperada, 1)` (la escala del error crece con el nivel de la serie; por eso es relativo), y por cada familia × formato de tienda `q = cuantil_τ(r)`. Entonces:
+
+`cantidad = ceil( max(0, esperada + q · max(esperada, 1)) )`
+
+- **Redondeo:** entero ≥ 0 como exige el contrato. Se usa `ceil` porque la demanda es entera: el cuantil discreto es el menor entero con probabilidad acumulada ≥ τ, es decir el techo del cuantil continuo (y es coherente con τ alto). Frente a `round` la diferencia fue < 0,1 %.
+- **Familia × formato** solo si hay datos suficientes: una celda usa su propio `q` si `n · min(τ, 1−τ) ≥ 15` observaciones en la cola relevante; si no, hereda el de la familia. Con 112 días de calibración las 36 celdas (12 familias × 3 formatos) tuvieron factor propio; con 56 días licores (τ = 0,95) no alcanzaba. El formato aporta poco (−0,1 % de costo frente a solo familia) pero no cuesta nada y los factores de express difieren (p. ej. bebé: 0,55 en express vs 0,26 en hipermercado).
+- Los **factores son parte del modelo**: se recalculan en cada entrenamiento y se guardan junto con él (`factores_newsvendor.json` en el run y dentro del pyfunc), porque al reentrenar cambian.
+- **Aviso:** la ventana de calibración incluye diciembre (picos de aguinaldo y Navidad), que ensancha un poco los cuantiles altos.
+
+**Comparación de costos** (LightGBM, protocolo de exploración, costo total en la prueba con `costos.csv`):
+
+| Regla | Costo total | % días sin faltante |
+|---|---|---|
+| `cantidad_sugerida` = esperada redondeada | 230 692 | 52,5 % |
+| Cuantil relativo solo por familia (ceil) | 176 214 | 71,0 % |
+| **Cuantil relativo familia × formato (ceil) — elegida** | **176 080** | 70,4 % |
+| Cuantil relativo familia × formato (round) | 176 156 | 69,8 % |
+| Cuantil **aditivo** (real − esperada) por familia | 187 938 | 70,4 % |
+| Un solo factor para todas las familias (τ medio) | 238 091 | 72,6 % |
+
+La regla basada en costos **ahorra ≈ 24 %** frente a servir la esperada; lo que aporta es usar el τ de **cada familia** (un único factor no ayuda: 238 091 es peor que no usar ninguno), y la escala relativa gana al error aditivo (−6 %).
+
+## D13. Empaquetado, registro en MLflow y conexión a la API (Paso 5)
+
+- **Un solo objeto, `Pronosticador`** (`ml/modelos.py`): modelo (LightGBM o baseline) + plan B + factores newsvendor + catálogos de tiendas y feriados. Se empaqueta como **modelo `pyfunc`** (`ml/empaquetado.py`): quien lo carga solo llama a `predict(historia)` y recibe `venta_esperada` y `cantidad_sugerida`. Las dependencias van fijadas (`mlflow`, `pandas`, `lightgbm`).
+- **Experimento `novamercado-pronostico`:** un run por modelo (`baseline_seasonal_naive`, `lightgbm_global`), con parámetros, métricas de prueba, factores, lista de features y el modelo. **Registro:** el de menor costo de prueba se registra como una versión de `novamercado-ventas` y recibe el alias **`champion`**. (El criterio para reemplazarlo al reentrenar es el Paso 6.)
+- **Entrenar:** `python -m ml.entrenar [--fuente db|csv] [--fecha-corte AAAA-MM-DD] [--sin-mlflow]`. En Docker: `docker compose run --rm init python -m ml.entrenar` (lee la vista de app-db y habla con MLflow). La función reutilizable es `ml.entrenar.entrenar(datos, fecha_corte) -> Resultado`; el DAG del Paso 6 y el `init` del Paso 8 la llamarán.
+- **API:** al arrancar carga `models:/novamercado-ventas/<versión del @champion>` **una sola vez** (por número de versión, para que alias y modelo no se desincronicen) y la guarda en memoria. **Nunca contacta a MLflow dentro de una predicción**: probado con MLflow detenido. Si MLflow está caído o aún no hay `champion` al arrancar, la API arranca sin modelo (`/health` 503, predicciones 503) y hay que reiniciarla: el sondeo cada 30 s sin reinicio es el Paso 7. `GET /modelo` devuelve `{nombre, alias, version}`.
+- La imagen de la API usa `mlflow-skinny==3.18.0` (cliente + pyfunc, sin servidor; misma versión que `mlflow` y que la imagen de Airflow), `pandas`, `numpy` y `lightgbm` fijados, y copia `ml/`.
+- **Operación:** el servidor MLflow se quedaba sin memoria (OOM, `-9`) con 768 MB al registrar el modelo; se subió a 1,5 GB. El equipo tiene ≈ 3,8 GB: con Airflow también levantado conviene vigilar la memoria.

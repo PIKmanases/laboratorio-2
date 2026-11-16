@@ -3,11 +3,10 @@ solicitud (`engine.begin()`): se guarda todo junto o nada."""
 
 import logging
 import math
-from collections.abc import Sequence
 from datetime import date
 from typing import Any, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -150,29 +149,15 @@ def upsert_observaciones(conn, solicitud: ObservacionVentas, solicitud_id: int) 
     return len(conn.execute(stmt).all())
 
 
-class PredictorSQL:
-    """Predictor falso sobre la vista de entrenamiento: promedio de (tienda, familia) en
-    fechas ESTRICTAMENTE anteriores a la pedida. Incluye las observaciones que llegaron.
-    Sin app-db no puede predecir -> ErrorPersistencia (503)."""
+def historia_desde_db(engine: Engine):
+    """Devuelve la función que lee la historia reciente (solo fechas < D) para `PredictorML`.
+    Sin app-db no se puede predecir: ErrorPersistencia -> 503."""
+    from ml.datos import historia_reciente
 
-    version = "0"
-
-    def __init__(self, engine: Engine):
-        self._engine = engine
-
-    def predecir(self, tienda_id: int, fecha: date, familias: Sequence) -> dict[str, float]:
-        from sqlalchemy import column, table
-
-        v = table("ventas_para_entrenamiento", column("tienda_id"), column("familia_id"), column("fecha"), column("ventas"))
-        ids = [f.familia_id for f in familias]
-        q = (
-            select(v.c.familia_id, func.avg(v.c.ventas))
-            .where(v.c.tienda_id == tienda_id, v.c.fecha < fecha, v.c.familia_id.in_(ids))
-            .group_by(v.c.familia_id)
-        )
+    def leer(tienda_id: int, fecha: date, familias: list[str]):
         try:
-            with self._engine.connect() as conn:
-                medias = {fam: float(m) for fam, m in conn.execute(q)}
+            return historia_reciente(engine, tienda_id, fecha, familias)
         except SQLAlchemyError as e:
-            raise ErrorPersistencia(f"no se pudo consultar el histórico: {type(e).__name__}") from e
-        return {fam: medias.get(fam, 0.0) for fam in ids}
+            raise ErrorPersistencia(f"no se pudo leer la historia: {type(e).__name__}") from e
+
+    return leer
