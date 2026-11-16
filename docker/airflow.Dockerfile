@@ -13,3 +13,8 @@ RUN pip install --no-cache-dir \
     pandas==3.1.1 \
     scikit-learn==1.9.1 \
     lightgbm==4.7.0
+
+# Código de ML compartido con la API (features, modelos, newsvendor, criterio de promoción).
+# Va en la imagen (no en un volumen) para que DAG, API y entrenamiento usen la misma versión.
+COPY --chown=airflow:0 ml /opt/airflow/ml
+ENV PYTHONPATH=/opt/airflow

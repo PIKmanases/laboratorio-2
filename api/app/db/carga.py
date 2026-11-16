@@ -18,13 +18,21 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Connection, Engine
 
-from ..config import get_settings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from ..limpieza import Calidad, Catalogos, SolicitudRechazada
 from ..limpieza.campos import a_familia, a_tienda
 from .esquema import crear_esquema
 from .modelos import Costo, EstadoSistema, Familia, Feriado, Tienda, VentaHistorica
 
 logger = logging.getLogger("api.carga")
+
+
+class SettingsCarga(BaseSettings):
+    """Solo lo que necesita la carga: no depende de la configuración de la API (Airflow, MLflow...)."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+    database_url: str
+    data_dir: str = "/data"
 LOTE = 5000
 
 
@@ -127,7 +135,7 @@ def cargar(engine: Engine, directorio: Path) -> bool:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    settings = get_settings()
+    settings = SettingsCarga()
     engine = create_engine(settings.database_url, pool_pre_ping=True)
     cargar(engine, Path(settings.data_dir))
 

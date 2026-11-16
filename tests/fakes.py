@@ -66,3 +66,50 @@ class PredictorPromedio:
             esperada = self._acum[k][n - 1] / n if n else 0.0
             out.append(Pronostico(fam.familia_id, esperada, max(0, round(esperada))))
         return ResultadoPredictor("0", out)
+
+
+# ---------------------------------------------------------------- Airflow y reentrenamientos falsos
+from app.airflow_client import AirflowNoDisponible  # noqa: E402
+from app.db.repositorio import ErrorPersistencia as _EP  # noqa: E402
+
+
+class AirflowFalso:
+    def __init__(self):
+        self.disparados: list[str] = []
+        self.consultados: list[str] = []
+        self.estados: dict[str, str] = {}
+        self.caido = False  # simula Airflow sin responder / credenciales malas / DAG inexistente
+
+    def disparar(self, dag_run_id):
+        if self.caido:
+            raise AirflowNoDisponible("simulado")
+        self.disparados.append(dag_run_id)
+        self.estados[dag_run_id] = "queued"
+
+    def estado(self, dag_run_id):
+        self.consultados.append(dag_run_id)
+        if self.caido:
+            raise AirflowNoDisponible("simulado")
+        return self.estados.get(dag_run_id)
+
+
+class ReentrenamientosMemoria:
+    def __init__(self):
+        self.filas: dict[str, dict] = {}
+        self.caida = False
+
+    def _revisar(self):
+        if self.caida:
+            raise _EP("app-db caída (simulada)")
+
+    def crear(self, dag_run_id):
+        self._revisar()
+        self.filas[dag_run_id] = {"dag_run_id": dag_run_id, "estado": "en_curso", "promovido": None, "version_anterior": None,
+                                  "version_nueva": None, "motivo": None}  # fmt: skip
+
+    def borrar(self, dag_run_id):
+        self.filas.pop(dag_run_id, None)
+
+    def obtener(self, dag_run_id):
+        self._revisar()
+        return self.filas.get(dag_run_id)
