@@ -51,6 +51,19 @@ def ventanas(fin: pd.Timestamp, fecha_corte: date | None, dias_calibracion: int,
     return corte, corte + pd.Timedelta(days=dias_calibracion)
 
 
+def validar_ids(datos: Datos) -> None:
+    """Los `familia_id` / `tienda_id` de ventas deben ser EXACTAMENTE los de costos y tiendas.
+
+    Un id escrito distinto («panadería» vs «panaderia») no daría error: la familia quedaría sin
+    factor, con costo NaN o como categoría desconocida para LightGBM. Se exige coincidencia."""
+    fam_v, fam_c = set(datos.ventas["familia_id"]), set(datos.costos["familia_id"])
+    if fam_v != fam_c:
+        raise ValueError(f"familia_id distintos entre ventas y costos: solo en ventas={sorted(fam_v - fam_c)}, solo en costos={sorted(fam_c - fam_v)}")
+    sin_tienda = set(datos.ventas["tienda_id"]) - set(datos.tiendas["tienda_id"])
+    if sin_tienda:
+        raise ValueError(f"tienda_id en ventas que no existen en tiendas: {sorted(sin_tienda)}")
+
+
 def _ajustar(tipo: str, X: pd.DataFrame, y: pd.Series, fecha: pd.Series, params: dict | None):
     modelo = MODELOS[tipo](params) if tipo == "lightgbm" else MODELOS[tipo]()
     return modelo.ajustar(X, y, fecha)
@@ -65,6 +78,7 @@ def entrenar(
     dias_prueba: int = DIAS_PRUEBA,
     por_formato: bool = True,
 ) -> Resultado:
+    validar_ids(datos)
     X = construir_features(datos.ventas, datos.tiendas, datos.feriados)
     y = datos.ventas["ventas"].astype(float)
     fecha = pd.to_datetime(datos.ventas["fecha"])
