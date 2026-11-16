@@ -1,5 +1,6 @@
-# Esqueleto inicial: solo bases de datos.
-# Próximos servicios: FastAPI, MLflow, Airflow.
+# Servicios: bases PostgreSQL, MLflow, API y Airflow.
+# Airflow basado en el docker-compose.yaml oficial 3.4.0, con LocalExecutor
+# (sin redis, worker, flower ni airflow-cli).
 
 x-postgres: &postgres-base
   image: postgres:17.12
@@ -7,8 +8,57 @@ x-postgres: &postgres-base
   networks:
     - backend
 
+x-airflow-common:
+  &airflow-common
+  # Imagen propia (docker/airflow.Dockerfile): mlflow, pandas, scikit-learn y LightGBM.
+  build:
+    context: .
+    dockerfile: docker/airflow.Dockerfile
+  image: laboratorio-2-airflow:3.4.0
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # Poca RAM (WSL2 ~4-5 GB): menos concurrencia y procesos.
+    AIRFLOW__CORE__PARALLELISM: '4'
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: '4'
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: '1'
+    AIRFLOW__API_SERVER__WORKERS: '1'
+    # Conexiones que usan los DAGs (nunca escritas en el código).
+    APP_DB_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    # yamllint disable rule:line-length
+    # Use simple http server on scheduler for health checks
+    # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
+    # yamllint enable rule:line-length
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # The following line can be used to set a custom config file, stored in the local config folder
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    airflow-db:
+      condition: service_healthy
+    app-db:
+      condition: service_healthy
+  networks:
+    - backend
+
 services:
   app-db:
+    mem_limit: 256m
     <<: *postgres-base
     environment:
       POSTGRES_DB: ${APP_DB_NAME}
@@ -24,6 +74,7 @@ services:
       start_period: 10s
 
   mlflow-db:
+    mem_limit: 256m
     <<: *postgres-base
     environment:
       POSTGRES_DB: ${MLFLOW_DB_NAME}
@@ -38,10 +89,225 @@ services:
       retries: 5
       start_period: 10s
 
-# Sin "ports": las bases solo son accesibles dentro de esta red.
+  mlflow:
+    mem_limit: 768m
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@mlflow-db:5432/${MLFLOW_DB_NAME}
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+      --workers 1
+      --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  api:
+    mem_limit: 512m
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      DATA_DIR: /data
+    volumes:
+      # CSV del curso: fuera de la imagen. Paso 8 los cargará a app-db y este montaje sobrará.
+      - ./data:/data:ro
+    depends_on:
+      app-db:
+        condition: service_healthy
+      # started (no healthy): la API debe arrancar y responder aunque MLflow esté caído.
+      mlflow:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    networks:
+      - backend
+
+  airflow-db:
+    mem_limit: 256m
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  airflow-apiserver:
+    mem_limit: 1g
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    mem_limit: 1g
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    mem_limit: 768m
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    mem_limit: 1g
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    # yamllint disable rule:line-length
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set "
+          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+          echo "For other operating systems you can get rid of the warning with manually created .env file:"
+          echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
+          echo
+          export AIRFLOW_UID=$$(id -u)
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+        warning_resources="false"
+        if (( mem_available < 4000 )) ; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+          echo "At least 4GB of memory required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
+          echo
+          warning_resources="true"
+        fi
+        if (( cpus_available < 2 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+          echo "At least 2 CPUs recommended. You have $${cpus_available}"
+          echo
+          warning_resources="true"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+          echo "At least 10 GBs recommended. You have $$(numfmt --to iec $$((disk_available * 1024 )))"
+          echo
+          warning_resources="true"
+        fi
+        if [[ $${warning_resources} == "true" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow (see above)!\e[0m"
+          echo "Please follow the instructions to increase amount of resources available:"
+          echo "   https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#before-you-begin"
+          echo
+        fi
+        echo
+        echo "Creating missing opt dirs if missing:"
+        echo
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        echo
+        echo "Airflow version:"
+        /entrypoint airflow version
+        echo
+        echo "Files in shared volumes:"
+        echo
+        ls -la /opt/airflow/{logs,dags,plugins,config}
+        echo
+        echo "Running airflow config list to create default config file if missing."
+        echo
+        /entrypoint airflow config list >/dev/null
+        echo
+        echo "Files in shared volumes:"
+        echo
+        ls -la /opt/airflow/{logs,dags,plugins,config}
+        echo
+        echo "Change ownership of files in /opt/airflow to ${AIRFLOW_UID:-50000}:0"
+        echo
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/
+        echo
+        echo "Change ownership of files in shared volumes to ${AIRFLOW_UID:-50000}:0"
+        echo
+        chown -v -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config}
+        echo
+        echo "Files in shared volumes:"
+        echo
+        ls -la /opt/airflow/{logs,dags,plugins,config}
+
+    # yamllint enable rule:line-length
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    user: "0:0"
+
+# Sin "ports" en las bases: solo son accesibles dentro de esta red.
 networks:
   backend:
 
 volumes:
   app_db_data:
   mlflow_db_data:
+  mlflow_artifacts:
+  airflow_db_data:
