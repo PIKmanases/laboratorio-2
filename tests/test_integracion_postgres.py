@@ -10,13 +10,14 @@ import os
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from sqlalchemy import create_engine, text
 
 from app.db.carga import cargar
 from app.db.esquema import crear_esquema
 from app.db.modelos import Base
-from app.db.repositorio import ErrorPersistencia, PredictorSQL, RepositorioSQL
+from app.db.repositorio import ErrorPersistencia, RepositorioSQL, historia_desde_db
 from app.esquemas import (
     FamiliaSolicitada,
     ObservacionVentas,
@@ -141,7 +142,7 @@ def test_base_caida_lanza_error_de_persistencia():
     with pytest.raises(ErrorPersistencia):
         RepositorioSQL(muerto).guardar_rechazo("prediccion", {}, None, "m")
     with pytest.raises(ErrorPersistencia):
-        PredictorSQL(muerto).predecir(5, D, [FamiliaSolicitada(familia_id="abarrotes", en_promocion=0)])
+        historia_desde_db(muerto)(5, D, ["abarrotes"])
 
 
 def test_cuerpo_con_nan_y_nul_no_rompe_el_registro(repo, engine):
@@ -184,14 +185,38 @@ def test_vista_no_duplica_dias_que_estan_en_el_historico(repo, engine):
     assert len(filas) == 2
 
 
-# ------------------------------------------------------------------ predictor sobre la BD
-def test_predictor_sql_sin_fuga_e_incluye_observaciones(repo, engine):
+# ------------------------------------------------------------------ historia para el modelo
+def test_historia_reciente_solo_dias_anteriores_y_en_ventana(repo, engine):
     with engine.begin() as c:
-        c.execute(text("INSERT INTO ventas_historicas VALUES (5,'abarrotes','2025-11-14',100,0),(5,'abarrotes','2025-11-15',200,0)"))
+        c.execute(text("INSERT INTO ventas_historicas VALUES (5,'abarrotes','2025-08-01',1,0),(5,'abarrotes','2025-11-14',100,0),(5,'abarrotes','2025-11-15',200,0),(6,'abarrotes','2025-11-15',7,0)"))
     repo.guardar_observacion(obs({"abarrotes": 600}, fecha=date(2025, 11, 16)), Calidad(), {})
-    repo.guardar_observacion(obs({"abarrotes": 9999}), Calidad(), {})  # el propio día: no cuenta
-    p = PredictorSQL(engine).predecir(5, D, [FamiliaSolicitada(familia_id="abarrotes", en_promocion=0), FamiliaSolicitada(familia_id="bebidas", en_promocion=0)])
-    assert p == {"abarrotes": 300.0, "bebidas": 0.0}
+    repo.guardar_observacion(obs({"abarrotes": 9999}), Calidad(), {})  # el propio día D: NO debe entrar
+    h = historia_desde_db(engine)(5, D, ["abarrotes", "bebidas"])
+    assert sorted(h["ventas"]) == [100, 200, 600]  # sin 2025-08-01 (fuera de 60 días), sin D, sin otra tienda
+    assert h["fecha"].max() < pd.Timestamp(D)
+
+
+def test_prediccion_de_punta_a_punta_con_la_bd(repo, engine):
+    """Pronosticador real (entrenado con datos sintéticos) + historia leída de Postgres."""
+    from app.modelo_mlflow import ModeloCargado
+    from app.predictor import PredictorML
+    from sinteticos import datos_sinteticos
+
+    from ml.entrenar import entrenar
+
+    pron = entrenar(datos_sinteticos(dias=150), tipo="baseline", dias_calibracion=20, dias_prueba=20).modelo
+
+    class Directo:
+        def predict(self, df):
+            return pron.predecir(df)
+
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO ventas_historicas SELECT 5, 'abarrotes', d::date, 100, 0 FROM generate_series('2025-10-01'::date, '2025-11-16', '1 day') d"))
+    modelo = ModeloCargado("m", "champion", "7", Directo())
+    r = PredictorML(historia_desde_db(engine), lambda: modelo).predecir(5, D, [FamiliaSolicitada(familia_id="abarrotes", en_promocion=2)])
+    assert r.version == "7" and r.pronosticos[0].familia_id == "abarrotes"
+    assert r.pronosticos[0].venta_esperada == pytest.approx(100.0)  # media de los 4 mismos días: todos 100
+    assert r.pronosticos[0].cantidad_sugerida >= 100
 
 
 # ------------------------------------------------------------------ carga de CSV

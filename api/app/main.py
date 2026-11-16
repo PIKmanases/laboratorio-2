@@ -14,8 +14,9 @@ from . import rutas_v1
 from .config import get_settings
 from .health import HealthMonitor
 from .limpieza import Catalogos, SolicitudRechazada
-from .db.repositorio import ErrorPersistencia, PredictorSQL, Repositorio, RepositorioSQL
-from .predictor import Predictor
+from .db.repositorio import ErrorPersistencia, Repositorio, RepositorioSQL, historia_desde_db
+from .modelo_mlflow import cargar_modelo
+from .predictor import ModeloNoDisponible, Predictor, PredictorML
 
 logger = logging.getLogger("api")
 
@@ -25,6 +26,7 @@ def create_app(
     catalogos: Catalogos | None = None,
     predictor: Predictor | None = None,
     repositorio: Repositorio | None = None,
+    modelo=None,
 ) -> FastAPI:
     """Fábrica de la aplicación. Lo que se pasa aquí se inyecta (las pruebas usan fakes);
     lo que no, se construye en el arranque a partir de la configuración y de app-db."""
@@ -32,7 +34,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         st = app.state
-        engine = client = None
+        engine = client = settings = None
         if not (st.monitor and st.catalogos and st.predictor and st.repositorio):
             settings = get_settings()
             # create_engine es perezoso: no conecta, así la API arranca aunque la base tarde.
@@ -47,9 +49,16 @@ def create_app(
             if st.catalogos is None:  # tablas de referencia que cargó el contenedor `init`
                 st.catalogos = Catalogos.desde_db(engine)
             if st.predictor is None:
-                st.predictor = PredictorSQL(engine)
+                st.predictor = PredictorML(historia_desde_db(engine), lambda: st.model)
             if st.repositorio is None:
                 st.repositorio = RepositorioSQL(engine)
+        if st.model is None and settings is not None:
+            # Una sola vez al arrancar. Si MLflow está caído o aún no hay `champion`, la API
+            # arranca igual (sin modelo: /health 503). El sondeo del alias llega en el paso 7.
+            try:
+                st.model = await run_in_threadpool(cargar_modelo, settings.mlflow_tracking_uri)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("no se pudo cargar el modelo al arrancar: %s", e)
         task = asyncio.create_task(st.monitor.run())
         try:
             yield
@@ -67,7 +76,7 @@ def create_app(
     app.state.catalogos = catalogos
     app.state.predictor = predictor
     app.state.repositorio = repositorio
-    app.state.model = None  # todavía no hay modelo real cargado (el predictor falso no cuenta)
+    app.state.model = modelo  # ModeloCargado o None (sin modelo: /health y predicciones dan 503)
 
     @app.exception_handler(SolicitudRechazada)
     async def _rechazo(_: Request, exc: SolicitudRechazada):
@@ -84,6 +93,10 @@ def create_app(
                 await run_in_threadpool(repo.guardar_rechazo, request.url.path.removeprefix("/v1/"), cuerpo, None, motivos)
         return JSONResponse(status_code=422, content={"detail": motivos})
 
+    @app.exception_handler(ModeloNoDisponible)
+    async def _sin_modelo(_: Request, exc: ModeloNoDisponible):
+        return JSONResponse(status_code=503, content={"detail": "no hay un modelo cargado todavía"})
+
     @app.exception_handler(ErrorPersistencia)
     async def _sin_base(_: Request, exc: ErrorPersistencia):
         # Política D6: sin app-db no se responde algo que no quedó registrado.
@@ -91,6 +104,13 @@ def create_app(
         return JSONResponse(status_code=503, content={"detail": "base de datos no disponible; reintente"})
 
     app.include_router(rutas_v1.router)
+
+    @app.get("/modelo")
+    async def modelo_vigente():
+        m = app.state.model
+        if m is None:
+            raise ModeloNoDisponible("no hay un modelo cargado")
+        return {"nombre": m.nombre, "alias": m.alias, "version": m.version}
 
     @app.get("/health")
     async def health(response: Response):

@@ -5,8 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.limpieza import Catalogos
 from app.main import create_app
-from app.predictor import PredictorPromedio
-from fakes import RepositorioMemoria
+from fakes import PredictorPromedio, RepositorioMemoria
 
 FAMILIAS = [
     ("abarrotes", "Abarrotes"), ("bebidas", "Bebidas"), ("lacteos", "Lácteos"), ("carnes", "Carnes"),

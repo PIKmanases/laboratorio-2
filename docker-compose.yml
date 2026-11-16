@@ -90,7 +90,7 @@ services:
       start_period: 10s
 
   mlflow:
-    mem_limit: 768m
+    mem_limit: 1536m
     build:
       context: .
       dockerfile: docker/mlflow.Dockerfile
@@ -123,7 +123,7 @@ services:
   # Arranque desde cero (una sola vez, idempotente): crea tablas y carga los CSV a app-db.
   # El paso 8 le añade el entrenamiento del primer modelo.
   init:
-    mem_limit: 256m
+    mem_limit: 1g  # el entrenamiento (paso 5) corre aquí con `python -m ml.entrenar`
     build:
       context: .
       dockerfile: docker/api.Dockerfile
