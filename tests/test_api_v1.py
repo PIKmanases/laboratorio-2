@@ -60,11 +60,11 @@ def test_json_roto_responde_422(client):
     assert r.status_code == 422 and "detail" in r.json()
 
 
-def test_observaciones_calidad_sin_base_de_datos(client):
+def test_observaciones_reporta_calidad_y_guardados(client):
     cuerpo = {"tienda_id": 5, "fecha": "2025-11-17", "ventas": [{"familia_id": "abarrotes", "ventas": "1,234"}, {"familia_id": "carnes", "ventas": -4}]}
     r = client.post("/v1/observaciones", json=cuerpo)
     j = r.json()
-    assert r.status_code == 200 and j["registros_guardados"] == 0
+    assert r.status_code == 200 and j["registros_guardados"] == 1  # el -4 se omitió
     assert j["calidad"]["estado"] == "advertencia"
     assert {(o["campo"], o["accion"]) for o in j["calidad"]["observaciones"]} >= {("ventas[0].ventas", "reparar"), ("ventas[1].ventas", "advertir")}
 

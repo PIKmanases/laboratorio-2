@@ -120,6 +120,28 @@ services:
       retries: 5
       start_period: 30s
 
+  # Arranque desde cero (una sola vez, idempotente): crea tablas y carga los CSV a app-db.
+  # El paso 8 le añade el entrenamiento del primer modelo.
+  init:
+    mem_limit: 256m
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    command: ["python", "-m", "app.db.carga"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      DATA_DIR: /data
+    volumes:
+      # Los datos no van en la imagen: se montan de solo lectura.
+      - ./data:/data:ro
+    depends_on:
+      app-db:
+        condition: service_healthy
+    networks:
+      - backend
+
   api:
     mem_limit: 512m
     build:
@@ -129,13 +151,12 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      DATA_DIR: /data
-    volumes:
-      # CSV del curso: fuera de la imagen. Paso 8 los cargará a app-db y este montaje sobrará.
-      - ./data:/data:ro
     depends_on:
       app-db:
         condition: service_healthy
+      # Las tablas de referencia (tiendas, familias...) las carga `init`; la API las lee al arrancar.
+      init:
+        condition: service_completed_successfully
       # started (no healthy): la API debe arrancar y responder aunque MLflow esté caído.
       mlflow:
         condition: service_started

@@ -35,5 +35,17 @@ class Catalogos:
             familias = [(r["familia_id"], r["nombre"]) for r in csv.DictReader(f)]
         return cls.desde_filas(tiendas, familias)
 
+    @classmethod
+    def desde_db(cls, engine) -> "Catalogos":
+        """Lee las tablas de referencia (las carga el contenedor `init`)."""
+        from sqlalchemy import text
+
+        with engine.connect() as conn:
+            tiendas = [r[0] for r in conn.execute(text("SELECT tienda_id FROM tiendas"))]
+            familias = [tuple(r) for r in conn.execute(text("SELECT familia_id, nombre FROM familias ORDER BY familia_id"))]
+        if not tiendas or not familias:
+            raise RuntimeError("tiendas/familias vacías: falta la carga inicial (contenedor init)")
+        return cls.desde_filas(tiendas, familias)
+
     def resolver_familia(self, texto: str) -> str | None:
         return self._alias_familia.get(normalizar_texto(texto))
