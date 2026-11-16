@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # Carpeta con los CSV (tiendas, familias, histórico). Se monta como volumen, no va en la imagen.
     data_dir: str = "/data"
 
+    # Sondeo del alias del modelo (paso 7): adopta un modelo promovido sin reiniciar la API.
+    modelo_sondeo_intervalo: float = 30.0
+    modelo_consulta_timeout: float = 15.0
+    modelo_carga_timeout: float = 120.0
+
     # Chequeos en segundo plano. Peor caso para detectar una caída:
     # intervalo + timeout < 60 s.
     health_check_interval: float = 15.0

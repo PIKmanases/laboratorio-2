@@ -17,8 +17,9 @@ from .health import HealthMonitor
 from .limpieza import Catalogos, SolicitudRechazada
 from .db.reentrenamientos import ReentrenamientosSQL
 from .db.repositorio import ErrorPersistencia, Repositorio, RepositorioSQL, historia_desde_db
-from .modelo_mlflow import cargar_modelo
+from .modelo_mlflow import cargar_modelo, version_vigente
 from .predictor import ModeloNoDisponible, Predictor, PredictorML
+from .recarga import SondeoModelo
 
 logger = logging.getLogger("api")
 
@@ -31,6 +32,7 @@ def create_app(
     modelo=None,
     airflow=None,
     reentrenamientos=None,
+    sondeo=None,
 ) -> FastAPI:
     """Fábrica de la aplicación. Lo que se pasa aquí se inyecta (las pruebas usan fakes);
     lo que no, se construye en el arranque a partir de la configuración y de app-db."""
@@ -61,19 +63,29 @@ def create_app(
             if st.airflow is None:
                 st.airflow = AirflowClient(settings.airflow_url, settings.airflow_user, settings.airflow_password, settings.airflow_dag_id, settings.airflow_timeout)
         if st.model is None and settings is not None:
-            # Una sola vez al arrancar. Si MLflow está caído o aún no hay `champion`, la API
-            # arranca igual (sin modelo: /health 503). El sondeo del alias llega en el paso 7.
+            # Primera carga al arrancar. Si MLflow está caído o aún no hay `champion`, la API
+            # arranca igual (sin modelo: /health 503) y el sondeo la cargará cuando pueda.
             try:
                 st.model = await run_in_threadpool(cargar_modelo, settings.mlflow_tracking_uri)
             except Exception as e:  # noqa: BLE001
                 logger.warning("no se pudo cargar el modelo al arrancar: %s", e)
-        task = asyncio.create_task(st.monitor.run())
+        if st.sondeo is None and settings is not None:
+            uri = settings.mlflow_tracking_uri
+            st.sondeo = SondeoModelo(
+                st, lambda: version_vigente(uri), lambda v: cargar_modelo(uri, version=v),
+                settings.modelo_sondeo_intervalo, settings.modelo_consulta_timeout, settings.modelo_carga_timeout,
+            )  # fmt: skip
+        tareas = [asyncio.create_task(st.monitor.run())]
+        if st.sondeo is not None:  # sin sondeo (pruebas) el modelo inyectado no cambia
+            tareas.append(asyncio.create_task(st.sondeo.run()))
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            for t in tareas:
+                t.cancel()
+            for t in tareas:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
             if client:
                 await client.aclose()
             if engine:
@@ -86,6 +98,7 @@ def create_app(
     app.state.repositorio = repositorio
     app.state.airflow = airflow
     app.state.reentrenamientos = reentrenamientos
+    app.state.sondeo = sondeo
     app.state.model = modelo  # ModeloCargado o None (sin modelo: /health y predicciones dan 503)
 
     @app.exception_handler(SolicitudRechazada)
@@ -125,19 +138,18 @@ def create_app(
 
     @app.get("/health")
     async def health(response: Response):
+        """Contrato: 503 solo mientras no haya modelo; 200 `degradado` si falla otra dependencia."""
         checks = app.state.monitor.snapshot()
         model_loaded = app.state.model is not None
         checks["model"] = {"ok": model_loaded, "detail": "loaded" if model_loaded else "not_loaded"}
 
-        if not (model_loaded and checks["database"]["ok"]):
-            status, code = "unavailable", 503
-        elif not checks["mlflow"]["ok"]:
-            status, code = "degraded", 200
-        else:
-            status, code = "ok", 200
-
-        response.status_code = code
-        return {"status": status, "checks": checks}
+        if not model_loaded:
+            response.status_code = 503
+            return {"estado": "no_disponible", "motivo": "no hay modelo cargado", "checks": checks}
+        fallas = [f"{nombre}: {c['detail']}" for nombre, c in checks.items() if not c["ok"]]
+        if fallas:
+            return {"estado": "degradado", "motivo": "; ".join(fallas), "checks": checks}
+        return {"estado": "ok", "checks": checks}
 
     return app
 

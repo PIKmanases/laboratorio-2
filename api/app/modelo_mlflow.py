@@ -24,17 +24,31 @@ class ModeloCargado:
         return self._pyfunc.predict(historia)
 
 
-def cargar_modelo(tracking_uri: str, nombre: str = NOMBRE, alias: str = ALIAS) -> ModeloCargado:
-    """Bloqueante. Se llama al arrancar (y, en el paso 7, desde el sondeo en segundo plano),
-    jamás dentro de una predicción."""
+def _preparar_mlflow(tracking_uri: str):
     # Si MLflow está caído no debemos quedarnos minutos reintentando.
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "10")
     import mlflow
-    from mlflow import MlflowClient
 
     mlflow.set_tracking_uri(tracking_uri)
-    version = MlflowClient().get_model_version_by_alias(nombre, alias).version
+    return mlflow
+
+
+def version_vigente(tracking_uri: str, nombre: str = NOMBRE, alias: str = ALIAS) -> str:
+    """Versión a la que apunta el alias ahora mismo (una sola consulta liviana al registro).
+    Lanza excepción si MLflow no responde o el alias no existe."""
+    _preparar_mlflow(tracking_uri)
+    from mlflow import MlflowClient
+
+    return str(MlflowClient().get_model_version_by_alias(nombre, alias).version)
+
+
+def cargar_modelo(tracking_uri: str, nombre: str = NOMBRE, alias: str = ALIAS, version: str | None = None) -> ModeloCargado:
+    """Bloqueante. Se llama al arrancar y desde el sondeo en segundo plano (`app.recarga`),
+    jamás dentro de una predicción. Con `version` carga exactamente esa; sin ella, la del alias."""
+    mlflow = _preparar_mlflow(tracking_uri)
+    if version is None:
+        version = version_vigente(tracking_uri, nombre, alias)
     # Se carga por NÚMERO de versión (no por alias): si el alias se mueve entre las dos
     # llamadas, el número y el modelo cargado siguen coincidiendo.
     pyfunc = mlflow.pyfunc.load_model(f"models:/{nombre}/{version}")
