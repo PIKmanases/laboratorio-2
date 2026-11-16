@@ -31,7 +31,7 @@ el porqué, señala las alternativas y no introduzcas dependencias o complejidad
 | `airflow-dag-processor` | Airflow 3.x | — | Analiza `dags/` (servicio obligatorio en Airflow 3). |
 | `airflow-init` | Airflow 3.x (una sola vez) | — | Migra la BD de Airflow y crea el usuario admin. |
 | `airflow-db` | PostgreSQL 17 | 5432 (interno) | BD de Airflow. **Separada de `app-db`** (requisito). |
-| `init` | Imagen de API/ML (una sola vez) | — | Arranque desde cero: crea tablas (`create_all`) y carga los CSV (idempotente, monta `./data:/data:ro`). **Pendiente (paso 8):** entrenar y registrar el primer modelo. |
+| `init` | Imagen de API/ML (una sola vez) | — | Arranque desde cero: crea tablas (`create_all`) y carga los CSV (idempotente, monta `./data:/data:ro`) y entrena el primer modelo **solo si MLflow no tiene `@champion`** (`ml/arranque.py`, D16). |
 
 Conexiones dentro de la red de compose:
 - `api` → `app-db` (persistencia, catálogos y features recientes; arranca después de `init`), `mlflow` (sondea el alias del modelo vigente), `airflow-apiserver` (dispara y consulta el DAG).
@@ -67,7 +67,7 @@ Volúmenes con nombre: `app-db-data`, `mlflow-db-data`, `mlflow-artifacts`, `air
 - [x] Paso 5: `ml/` (features únicas, baseline seasonal naive, LightGBM global, newsvendor, métricas), experimento `novamercado-pronostico`, modelo `novamercado-ventas@champion` y conexión a la API (carga al arrancar; sondeo = paso 7). Entrenar: `docker compose run --rm init python -m ml.entrenar`.
 - [x] Paso 6: DAG `reentrenar_modelo` (`dags/`), lógica en `ml/reentrenamiento.py` y criterio de promoción en `ml/promocion.py` (costo de negocio con margen de 1,5 %, DECISIONES.md D14), endpoints `/admin/reentrenar` (`api/app/rutas_admin.py`, `airflow_client.py`, tabla `reentrenamientos`). Pruebas unitarias escritas; **falta verificarlo de extremo a extremo con el compose levantado** (promoción, rechazo, fallo y límite de 10 min).
 - [x] Paso 7: sondeo del alias cada 30 s y recarga en caliente (`api/app/recarga.py`, D15); si MLflow cae se conserva el modelo en memoria; `/health` alineado con el contrato (`estado`/`degradado`/503 sin modelo) y con chequeo de Airflow. Pruebas unitarias escritas; **falta verificarlo con el compose levantado** (adopción ≤ 2 min, `degradado` < 1 min, regreso a `ok` < 2 min).
-- [ ] Paso 8: arranque automático desde cero (contenedor `init`, idempotente).
+- [x] Paso 8: `init` = `app.db.carga` + `ml.arranque` (entrena solo si no hay `@champion`; fuente de verdad: el Model Registry; DECISIONES.md D16). Depende de `mlflow` con `service_healthy`. Pruebas unitarias escritas; **falta cronometrar `down -v` + `up`** (≤ 10 min hasta `/health` ok) y comprobar que `down` + `up` no reentrena.
 - [ ] Paso 9: README, DECISIONES.md, evidencia y tag `entrega-lab2`.
 
 ## Contrato de la API (Anexo del enunciado — no omitir ni renombrar campos)

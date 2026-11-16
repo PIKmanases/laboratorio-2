@@ -242,7 +242,7 @@ La regla basada en costos **ahorra ≈ 24 %** frente a servir la esperada; lo qu
 
 - **Un solo objeto, `Pronosticador`** (`ml/modelos.py`): modelo (LightGBM o baseline) + plan B + factores newsvendor + catálogos de tiendas y feriados. Se empaqueta como **modelo `pyfunc`** (`ml/empaquetado.py`): quien lo carga solo llama a `predict(historia)` y recibe `venta_esperada` y `cantidad_sugerida`. Las dependencias van fijadas (`mlflow`, `pandas`, `lightgbm`).
 - **Experimento `novamercado-pronostico`:** un run por modelo (`baseline_seasonal_naive`, `lightgbm_global`), con parámetros, métricas de prueba, factores, lista de features y el modelo. **Registro:** el de menor costo de prueba se registra como una versión de `novamercado-ventas` y recibe el alias **`champion`**. (El criterio para reemplazarlo al reentrenar es el Paso 6.)
-- **Entrenar:** `python -m ml.entrenar [--fuente db|csv] [--fecha-corte AAAA-MM-DD] [--sin-mlflow]`. En Docker: `docker compose run --rm init python -m ml.entrenar` (lee la vista de app-db y habla con MLflow). La función reutilizable es `ml.entrenar.entrenar(datos, fecha_corte) -> Resultado`; el DAG del Paso 6 y el `init` del Paso 8 la llamarán.
+- **Entrenar:** `python -m ml.entrenar [--fuente db|csv] [--fecha-corte AAAA-MM-DD] [--sin-mlflow]`. En Docker: `docker compose run --rm init python -m ml.entrenar` (lee la vista de app-db y habla con MLflow). La función reutilizable es `ml.entrenar.entrenar(datos, fecha_corte) -> Resultado`; el DAG del Paso 6 y el `init` del Paso 8 (D16) la llaman.
 - **API:** al arrancar carga `models:/novamercado-ventas/<versión del @champion>` (por número de versión, para que alias y modelo no se desincronicen) y la guarda en memoria (después la mantiene al día el sondeo de D15). **Nunca contacta a MLflow dentro de una predicción**: probado con MLflow detenido. Si MLflow está caído o aún no hay `champion` al arrancar, la API arranca sin modelo (`/health` 503, predicciones 503) y la carga queda para el sondeo cada 30 s (Paso 7, D15). `GET /modelo` devuelve `{nombre, alias, version}`.
 - La imagen de la API usa `mlflow-skinny==3.18.0` (cliente + pyfunc, sin servidor; misma versión que `mlflow` y que la imagen de Airflow), `pandas`, `numpy` y `lightgbm` fijados, y copia `ml/`.
 - **Operación:** el servidor MLflow se quedaba sin memoria (OOM, `-9`) con 768 MB al registrar el modelo; se subió a 1,5 GB. El equipo tiene ≈ 3,8 GB: con Airflow también levantado conviene vigilar la memoria.
@@ -304,3 +304,27 @@ La regla basada en costos **ahorra ≈ 24 %** frente a servir la esperada; lo qu
 - Los chequeos siguen en segundo plano cada 15 s (timeout 3 s): `/health` solo lee el último resultado y se entera de la caída de MLflow en < 20 s, y de su regreso en la misma medida (límites: < 1 min y < 2 min). Un resultado más viejo de 45 s cuenta como caído.
 
 **Pendiente de verificar con el sistema levantado:** promover un modelo con el DAG y comprobar que `/modelo` cambia solo en ≤ 2 min; `docker compose stop mlflow` y comprobar `degradado` en < 1 min, predicciones vigentes y regreso a `ok` en < 2 min. Las pruebas unitarias (`tests/test_recarga.py`, `tests/test_health.py`) cubren la lógica con fakes.
+
+## D16. Arranque desde cero e idempotencia del `init` (Paso 8)
+
+**Qué hace `init`.** Es un contenedor de una sola ejecución (`restart: "no"`, misma imagen que la API) con dos pasos encadenados; si el primero falla, el segundo no corre y `init` termina con error, de modo que la API (que depende de él con `service_completed_successfully`) no arranca con una base a medias:
+
+1. `python -m app.db.carga`: crea las tablas y vistas (`create_all`) y carga los CSV de `./data` (montado de solo lectura). Ya era idempotente (D8): si `ventas_historicas` tiene datos, no hace nada.
+2. `python -m ml.arranque`: entrena y registra el primer modelo **solo si MLflow no tiene el alias `champion`**.
+
+**Idempotencia del entrenamiento inicial.** La fuente de verdad es el **Model Registry**, no una bandera propia: se consulta `novamercado-ventas@champion` (`ml.reentrenamiento.version_vigente`, que devuelve `None` solo si el modelo o el alias no existen y propaga cualquier otro error).
+- Tras `docker compose down` + `up` (sin `-v`) los volúmenes de MLflow se conservan, el alias existe y **no se entrena**.
+- Con `down -v` (todo se borra) o si solo se borró el volumen de MLflow, el alias no existe y se entrena de nuevo; es lo correcto, porque sin `champion` la API no puede predecir.
+- Si `init` se interrumpe entre registrar la versión y poner el alias, la siguiente ejecución vuelve a entrenar (queda una versión huérfana sin alias, inofensiva).
+- *Alternativa descartada:* una bandera `modelo_inicial` en `estado_sistema`. Habría dos fuentes de verdad que pueden desincronizarse (bandera puesta y registro vacío dejaría la API sin modelo para siempre).
+
+**Qué entrena.** Lo mismo que `python -m ml.entrenar`: baseline seasonal naive y LightGBM con validación temporal (D11); el de menor costo de prueba queda como `champion` (D13). Lee de la vista `ventas_para_entrenamiento` de app-db, así que un `init` posterior a observaciones ya guardadas también las usaría.
+
+**Orden y espera.**
+- `init` depende de `app-db` y de **`mlflow` con `service_healthy`**: el entrenamiento necesita registrar el modelo. Es distinto de la API, que depende de `mlflow` con `service_started` para poder arrancar y responder aunque MLflow esté caído (D13/D15). Además `ml.arranque` reintenta la consulta al registro (12 intentos, 5 s) antes de rendirse; si MLflow nunca responde falla sin entrenar, porque no se puede saber si ya hay modelo.
+- La API carga el modelo al arrancar (ya existe) y `/health` queda en `ok` cuando también responden MLflow y Airflow; si la API arrancara antes de que exista el modelo, el sondeo de D15 lo cargaría solo.
+- `mem_limit: 1g` para `init` (el entrenamiento corre allí).
+
+**Presupuesto de tiempo (≤ 10 min hasta `/health` = ok, sin contar la construcción de imágenes).** Suma: arranque de bases y MLflow, carga de ~el histórico completo, entrenamiento de dos modelos y arranque de la API y de Airflow. **No está medido todavía**; hay que cronometrar `docker compose down -v && docker compose up -d` y ajustar si hace falta (p. ej. entrenar solo LightGBM en el arranque).
+
+**Cómo se prueba.** `tests/test_arranque.py` cubre la lógica con funciones falsas (sin MLflow, Postgres ni Docker): entrena sin champion, no entrena con champion, idempotencia, espera a MLflow, falla si MLflow nunca responde y propaga el error de entrenamiento. La verificación real (arranque desde cero y `down`/`up` sin repetir) queda pendiente con el sistema levantado.
