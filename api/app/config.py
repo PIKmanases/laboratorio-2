@@ -10,6 +10,13 @@ class Settings(BaseSettings):
     database_url: str
     mlflow_tracking_uri: str
 
+    # Airflow (API REST v2, autenticación JWT). Credenciales siempre por variable de entorno.
+    airflow_url: str = "http://airflow-apiserver:8080"
+    airflow_user: str
+    airflow_password: str
+    airflow_dag_id: str = "reentrenar_modelo"
+    airflow_timeout: float = 5.0
+
     # Carpeta con los CSV (tiendas, familias, histórico). Se monta como volumen, no va en la imagen.
     data_dir: str = "/data"
 

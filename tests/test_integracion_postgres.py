@@ -259,3 +259,37 @@ def test_carga_con_id_irresoluble_aborta_y_no_deja_nada(vacia, tmp_path):
     assert contar(vacia, "ventas_historicas") == 0 and contar(vacia, "tiendas") == 0
     with vacia.connect() as c:
         assert c.execute(text("SELECT count(*) FROM estado_sistema")).scalar_one() == 0
+
+
+# ------------------------------------------------------------------ reentrenamientos (paso 6)
+def test_reentrenamientos_crear_obtener_borrar(engine):
+    from app.db.reentrenamientos import ReentrenamientosSQL
+
+    r = ReentrenamientosSQL(engine)
+    assert r.obtener("x") is None
+    r.crear("x")
+    f = r.obtener("x")
+    assert f["estado"] == "en_curso" and f["promovido"] is None and f["iniciado_en"] is not None
+    with pytest.raises(ErrorPersistencia):
+        r.crear("x")  # dag_run_id único
+    r.borrar("x")
+    assert r.obtener("x") is None
+
+
+def test_registrar_resultado_completa_la_fila_que_creo_la_api_y_tambien_crea_si_no_existe(engine, monkeypatch):
+    from app.db.reentrenamientos import ReentrenamientosSQL
+    from ml import reentrenamiento as rt
+
+    monkeypatch.setattr(rt, "_cliente", lambda: (_ for _ in ()).throw(AssertionError("no debe tocar MLflow")))
+    r = ReentrenamientosSQL(engine)
+    r.crear("run-1")
+    plan = {"vigente_version": "3", "fin": "2026-02-28"}
+    dec = {"promover": True, "motivo": "mejora 9 %", "candidato": {"costo_total": float("nan")}}  # NaN no debe romper el JSON
+    out = rt.registrar_resultado(engine, "run-1", plan, {"version": "4"}, dec, {"promovido": True, "version": "4"})
+    f = r.obtener("run-1")
+    assert out["estado"] == f["estado"] == "exitoso" and f["promovido"] is True
+    assert (f["version_anterior"], f["version_nueva"], f["motivo"]) == ("3", "4", "mejora 9 %") and f["terminado_en"] is not None
+    assert f["metricas"]["decision"]["candidato"]["costo_total"] is None
+    # disparado desde la UI de Airflow: la API no creó la fila; el upsert la crea
+    rt.registrar_resultado(engine, "run-ui", plan, {"version": "5"}, {"promover": False, "motivo": "no supera"}, None)
+    assert r.obtener("run-ui")["estado"] == "exitoso" and r.obtener("run-ui")["promovido"] is False

@@ -31,11 +31,18 @@ def desde_csv(directorio: Path | str) -> Datos:
     )
 
 
-def desde_db(engine: Engine) -> Datos:
-    """Entrena sobre la vista `ventas_para_entrenamiento` (histórico + observaciones válidas)."""
+def desde_db(engine: Engine, hasta: date | None = None) -> Datos:
+    """Entrena sobre la vista `ventas_para_entrenamiento` (histórico + observaciones válidas).
+
+    `hasta`: último día incluido. El DAG de reentrenamiento fija esta «foto» al preparar los
+    datos para que todas sus tareas vean el mismo conjunto aunque lleguen observaciones nuevas."""
     with engine.connect() as c:
-        leer = lambda sql: pd.read_sql(text(sql), c)  # noqa: E731
-        ventas = leer("SELECT fecha, tienda_id, familia_id, ventas, en_promocion FROM ventas_para_entrenamiento")
+        leer = lambda sql, **p: pd.read_sql(text(sql), c, params=p or None)  # noqa: E731
+        ventas = leer(
+            "SELECT fecha, tienda_id, familia_id, ventas, en_promocion FROM ventas_para_entrenamiento "
+            "WHERE CAST(:hasta AS date) IS NULL OR fecha <= CAST(:hasta AS date)",
+            hasta=hasta,
+        )
         return Datos(
             ventas=ventas.assign(fecha=pd.to_datetime(ventas["fecha"]))[COLUMNAS_HISTORIA],
             tiendas=leer("SELECT tienda_id, nombre, ciudad, departamento, tipo FROM tiendas"),

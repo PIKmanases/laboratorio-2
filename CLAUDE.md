@@ -50,7 +50,7 @@ Volúmenes con nombre: `app-db-data`, `mlflow-db-data`, `mlflow-artifacts`, `air
 ├── CLAUDE.md
 ├── data/                   # CSV publicados por el equipo docente (ignorado por git)
 ├── api/                    # FastAPI: app/, requirements.txt
-├── ml/                     # features (UNA función), modelos, newsvendor, métricas, entrenar, registro MLflow (paso 6: criterio de promoción)
+├── ml/                     # features (UNA función), modelos, newsvendor, métricas, entrenar, registro MLflow (criterio de promoción y pasos del reentrenamiento)
 ├── dags/                   # DAGs de Airflow
 ├── docker/                 # Dockerfiles (api, mlflow, airflow)
 ├── scripts/                # utilidades (p. ej. simulador/evaluador propio)
@@ -65,7 +65,7 @@ Volúmenes con nombre: `app-db-data`, `mlflow-db-data`, `mlflow-artifacts`, `air
 - [x] Paso 3: contrato con Pydantic + capa de limpieza con pruebas.
 - [x] Paso 4: esquema de BD (`app/db/`), persistencia por transacción, observaciones idempotentes (upsert en la BD), vista `ventas_para_entrenamiento`, carga de CSV por `init`. Si app-db cae, las predicciones/observaciones responden **503** (DECISIONES.md D6).
 - [x] Paso 5: `ml/` (features únicas, baseline seasonal naive, LightGBM global, newsvendor, métricas), experimento `novamercado-pronostico`, modelo `novamercado-ventas@champion` y conexión a la API (carga al arrancar; sondeo = paso 7). Entrenar: `docker compose run --rm init python -m ml.entrenar`.
-- [ ] Paso 6: DAG de reentrenamiento + criterio de promoción.
+- [x] Paso 6: DAG `reentrenar_modelo` (`dags/`), lógica en `ml/reentrenamiento.py` y criterio de promoción en `ml/promocion.py` (costo de negocio con margen de 1,5 %, DECISIONES.md D14), endpoints `/admin/reentrenar` (`api/app/rutas_admin.py`, `airflow_client.py`, tabla `reentrenamientos`). Pruebas unitarias escritas; **falta verificarlo de extremo a extremo con el compose levantado** (promoción, rechazo, fallo y límite de 10 min).
 - [ ] Paso 7: recarga del modelo sin reinicio, resiliencia ante la caída de MLflow.
 - [ ] Paso 8: arranque automático desde cero (contenedor `init`, idempotente).
 - [ ] Paso 9: README, DECISIONES.md, evidencia y tag `entrega-lab2`.
@@ -158,9 +158,17 @@ curl -s localhost:8080/api/v2/dags/<dag_id>/dagRuns/<dag_run_id> -H "Authorizati
 - `ml/features.py`: **`construir_features` es la única función de features**; la usan el entrenamiento y la API (`PredictorML`). No dupliques lógica de features en la API. Solo datos hasta D-1 + `en_promocion` de D + calendario + atributos fijos (DECISIONES.md D9).
 - Falta de historia: LightGBM maneja NaN; si una serie no tiene ventas en 28 días se usa el **plan B** (media familia × formato × día). Ver D10.
 - Validación SIEMPRE temporal: entrenamiento → calibración (56 d) → prueba (56 d). `entrenar(datos, fecha_corte)`; los factores newsvendor se recalculan en cada entrenamiento y viajan dentro del modelo (D11, D12).
-- `ml/` se copia a la imagen de la API (`docker/api.Dockerfile`); la imagen de Airflow debe incluirla en el paso 6. Versiones de `mlflow`/`pandas`/`lightgbm` iguales en `api`, `mlflow` y Airflow (en la API se usa `mlflow-skinny`).
+- `ml/` se copia a la imagen de la API (`docker/api.Dockerfile`); la imagen de Airflow también la incluye (`COPY ml`, `PYTHONPATH=/opt/airflow`). Versiones de `mlflow`/`pandas`/`lightgbm` iguales en `api`, `mlflow` y Airflow (en la API se usa `mlflow-skinny`).
 - `python scripts/explorar_modelos.py` reproduce las comparaciones de DECISIONES.md D11/D12.
-- Tras entrenar hay que **reiniciar la API** para que cargue el `champion` (hasta el paso 7).
+- Tras entrenar o reentrenar hay que **reiniciar la API** para que cargue el `champion` (hasta el paso 7).
+
+## Reentrenamiento (paso 6)
+
+- Flujo del DAG: `preparar_datos → entrenar_candidato → evaluar_y_decidir → promover → registrar_resultado`. **Solo `promover` mueve el alias `champion`**; el candidato se registra siempre como versión sin alias. No añadas otro punto que mueva el alias.
+- Criterio: `costo_candidato < costo_vigente × (1 − MARGEN_PROMOCION)` en la misma ventana de prueba; el vigente se reajusta si ya vio esa ventana (D14). La lógica no depende de Airflow: pruébala en `tests/test_reentrenamiento.py` y `tests/test_promocion.py`.
+- La API elige el `dag_run_id`, lo guarda en `reentrenamientos` antes de disparar y lo borra si Airflow no responde. Un segundo disparo se encola (`max_active_runs=1`), no se rechaza.
+- Sin reintentos en el DAG y `dagrun_timeout` de 9 min (límite de 10 min por reentrenamiento).
+- Las tareas del DAG leen de `app-db` con `APP_DB_URL`, nunca de la BD de Airflow.
 
 ## Problemas conocidos y sus soluciones
 - **El servicio `mlflow` necesita ~1,5 GB** (con 768 MB lo mata el OOM-killer al registrar modelos: «server process exited with code -9»). `docker inspect -f '{{.State.OOMKilled}}' <contenedor>` lo confirma.

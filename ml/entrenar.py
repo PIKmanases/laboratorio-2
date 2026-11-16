@@ -64,6 +64,32 @@ def validar_ids(datos: Datos) -> None:
         raise ValueError(f"tienda_id en ventas que no existen en tiendas: {sorted(sin_tienda)}")
 
 
+def calcular_metricas(ev: pd.DataFrame, costos: pd.DataFrame) -> dict[str, float]:
+    """`ev`: familia_id, real, esperada, sugerida. Técnicas (sobre esperada) + negocio (sobre sugerida)."""
+    return metricas.tecnicas(ev["real"].to_numpy(), ev["esperada"].to_numpy()) | metricas.negocio(ev, costos)
+
+
+def evaluar_modelo(pron: Pronosticador, datos: Datos, desde: date | pd.Timestamp, hasta: date | pd.Timestamp | None = None) -> dict[str, float]:
+    """Evalúa un modelo YA ENTRENADO (p. ej. el vigente) en [desde, hasta] con sus propios factores.
+
+    Las features de cada día usan solo días anteriores de `datos`, como en producción. Quien llama
+    es responsable de que el modelo no haya entrenado con esa ventana (ver `ml.reentrenamiento`)."""
+    X = construir_features(datos.ventas, datos.tiendas, datos.feriados)
+    fecha = pd.to_datetime(datos.ventas["fecha"])
+    m = fecha >= pd.Timestamp(desde)
+    if hasta is not None:
+        m &= fecha <= pd.Timestamp(hasta)
+    if not m.any():
+        raise ValueError("la ventana de evaluación no tiene datos")
+    Xm = X[m]
+    esperada = pron.modelo.esperada(Xm)
+    ev = pd.DataFrame(
+        {"familia_id": Xm["familia_id"], "real": datos.ventas.loc[m, "ventas"].astype(float),
+         "esperada": esperada, "sugerida": pron.factores.cantidad(esperada, Xm["familia_id"], Xm["tipo"])}
+    )  # fmt: skip
+    return calcular_metricas(ev, datos.costos) | {"n_prueba": float(len(ev))}
+
+
 def _ajustar(tipo: str, X: pd.DataFrame, y: pd.Series, fecha: pd.Series, params: dict | None):
     modelo = MODELOS[tipo](params) if tipo == "lightgbm" else MODELOS[tipo]()
     return modelo.ajustar(X, y, fecha)
@@ -102,7 +128,7 @@ def entrenar(
     f_cal = calibrar(p_cal, datos.costos, por_formato)
     sugerida = f_cal.cantidad(p_prueba["esperada"].to_numpy(), p_prueba["familia_id"], p_prueba["tipo"])
     ev = p_prueba.assign(sugerida=sugerida)
-    m = metricas.tecnicas(ev["real"].to_numpy(), ev["esperada"].to_numpy()) | metricas.negocio(ev, datos.costos)
+    m = calcular_metricas(ev, datos.costos)
     m |= {"n_prueba": float(len(ev)), "n_calibracion": float(len(p_cal)), "n_entrenamiento": float(entr.sum())}
 
     # 3) modelo publicado: reajuste con todo y factores con calibración + prueba (out-of-sample)

@@ -10,10 +10,12 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import create_engine
 
-from . import rutas_v1
+from . import rutas_admin, rutas_v1
+from .airflow_client import AirflowClient
 from .config import get_settings
 from .health import HealthMonitor
 from .limpieza import Catalogos, SolicitudRechazada
+from .db.reentrenamientos import ReentrenamientosSQL
 from .db.repositorio import ErrorPersistencia, Repositorio, RepositorioSQL, historia_desde_db
 from .modelo_mlflow import cargar_modelo
 from .predictor import ModeloNoDisponible, Predictor, PredictorML
@@ -27,6 +29,8 @@ def create_app(
     predictor: Predictor | None = None,
     repositorio: Repositorio | None = None,
     modelo=None,
+    airflow=None,
+    reentrenamientos=None,
 ) -> FastAPI:
     """Fábrica de la aplicación. Lo que se pasa aquí se inyecta (las pruebas usan fakes);
     lo que no, se construye en el arranque a partir de la configuración y de app-db."""
@@ -35,7 +39,7 @@ def create_app(
     async def lifespan(app: FastAPI):
         st = app.state
         engine = client = settings = None
-        if not (st.monitor and st.catalogos and st.predictor and st.repositorio):
+        if not (st.monitor and st.catalogos and st.predictor and st.repositorio and st.airflow and st.reentrenamientos):
             settings = get_settings()
             # create_engine es perezoso: no conecta, así la API arranca aunque la base tarde.
             engine = create_engine(
@@ -52,6 +56,10 @@ def create_app(
                 st.predictor = PredictorML(historia_desde_db(engine), lambda: st.model)
             if st.repositorio is None:
                 st.repositorio = RepositorioSQL(engine)
+            if st.reentrenamientos is None:
+                st.reentrenamientos = ReentrenamientosSQL(engine)
+            if st.airflow is None:
+                st.airflow = AirflowClient(settings.airflow_url, settings.airflow_user, settings.airflow_password, settings.airflow_dag_id, settings.airflow_timeout)
         if st.model is None and settings is not None:
             # Una sola vez al arrancar. Si MLflow está caído o aún no hay `champion`, la API
             # arranca igual (sin modelo: /health 503). El sondeo del alias llega en el paso 7.
@@ -76,6 +84,8 @@ def create_app(
     app.state.catalogos = catalogos
     app.state.predictor = predictor
     app.state.repositorio = repositorio
+    app.state.airflow = airflow
+    app.state.reentrenamientos = reentrenamientos
     app.state.model = modelo  # ModeloCargado o None (sin modelo: /health y predicciones dan 503)
 
     @app.exception_handler(SolicitudRechazada)
@@ -104,6 +114,7 @@ def create_app(
         return JSONResponse(status_code=503, content={"detail": "base de datos no disponible; reintente"})
 
     app.include_router(rutas_v1.router)
+    app.include_router(rutas_admin.router)
 
     @app.get("/modelo")
     async def modelo_vigente():

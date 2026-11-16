@@ -103,7 +103,7 @@ Pasos 3–4: predictor falso (promedio histórico, `version_modelo = "0"`). **De
 | | `correcciones` | Una fila por observación de `calidad` (campo, acción, detalle), ligada a su solicitud. |
 | | `predicciones` | Una fila por familia: `venta_esperada`, `cantidad_sugerida`, `version_modelo` y la `en_promocion` declarada. Copia `tienda_id` y `fecha` de la solicitud (denormalización deliberada) para indexar la consulta de promociones sin join. |
 | | `observaciones` | Ventas reales. **PK (tienda, familia, fecha)**: es lo que permite el upsert. `valido` (por omisión `true`) permite excluir un registro del entrenamiento sin borrarlo; el upsert nunca lo modifica. |
-| c) Control | `reentrenamientos` | Una fila por ejecución del DAG (`dag_run_id`, estado, `promovido`, versiones, motivo, métricas). La usa el Paso 6; hoy está vacía. |
+| c) Control | `reentrenamientos` | Una fila por ejecución del DAG (`dag_run_id`, estado, `promovido`, versiones, motivo, métricas). La completa el DAG del Paso 6 (D14). |
 | | `estado_sistema` | Clave-valor. Hoy: `carga_inicial = completada`. |
 
 **`create_all`.** Las tablas se declaran con SQLAlchemy (`app/db/modelos.py`) y se crean con `Base.metadata.create_all()` más dos `CREATE OR REPLACE VIEW` (`app/db/esquema.py`). Es idempotente, pero **no altera tablas que ya existen**: si cambia una columna hay que reiniciar con `docker compose down -v` (aceptable en el laboratorio; en producción se usaría Alembic). Solo lo ejecuta el contenedor `init` (un único dueño del esquema, sin carreras): la API depende de `init` con `service_completed_successfully` y no crea tablas. *Alternativas descartadas:* SQL a mano en un `.sql` montado en `docker-entrypoint-initdb.d` (solo corre con el volumen vacío y duplica el esquema); Alembic (migraciones sin necesidad todavía).
@@ -247,3 +247,36 @@ La regla basada en costos **ahorra ≈ 24 %** frente a servir la esperada; lo qu
 - La imagen de la API usa `mlflow-skinny==3.18.0` (cliente + pyfunc, sin servidor; misma versión que `mlflow` y que la imagen de Airflow), `pandas`, `numpy` y `lightgbm` fijados, y copia `ml/`.
 - **Operación:** el servidor MLflow se quedaba sin memoria (OOM, `-9`) con 768 MB al registrar el modelo; se subió a 1,5 GB. El equipo tiene ≈ 3,8 GB: con Airflow también levantado conviene vigilar la memoria.
 - **Consistencia de `familia_id`:** en la BD, la vista, los factores (`tau`, `q_familia`, `q_celda`), el plan B, las categorías de LightGBM y las métricas por familia se usa exactamente el id canónico de `familias.csv` (`panaderia`, `frutas_verduras`...); «Panadería» o «Frutas y Verduras» solo existen como texto de entrada y la limpieza (D1) los convierte antes de llegar al modelo. Se verificó contra la BD y el modelo registrado en MLflow. Para que un id distinto no pase en silencio: `entrenar` exige que los ids de ventas coincidan con los de `costos`/`tiendas` (`validar_ids`) y `Pronosticador.predecir` falla con error explícito si recibe una familia sin factor (si no, LightGBM la trataría como categoría desconocida y el plan B daría 0). Hay pruebas en `tests/test_ml_ids.py`.
+
+## D14. Reentrenamiento y criterio de promoción (Paso 6)
+
+**Flujo.** `POST /admin/reentrenar` dispara el DAG `reentrenar_modelo` en Airflow; el DAG solo orquesta y la lógica vive en `ml/reentrenamiento.py` (probada sin Airflow) y `ml/promocion.py`:
+
+`preparar_datos → entrenar_candidato → evaluar_y_decidir → promover (solo si gana) → registrar_resultado`
+
+- **`preparar_datos`** fija una «foto» de los datos (`fin` = última fecha de la vista `ventas_para_entrenamiento`) y las ventanas temporales (entrenamiento → calibración 56 d → prueba 56 d). Así todas las tareas ven el mismo conjunto aunque lleguen observaciones nuevas durante la ejecución. Falla si hay menos de 60 días de entrenamiento o si los ids son inconsistentes (`validar_ids`).
+- **`entrenar_candidato`** entrena LightGBM con fecha < corte y lo **registra siempre** como versión nueva de `novamercado-ventas`, **sin alias**, con tags (`estado`, `dag_run_id`, `ultimo_dia`, `fecha_corte`). Gane o pierda, queda el linaje en MLflow.
+- **`evaluar_y_decidir`** compara contra el vigente y deja la decisión, el motivo y las métricas como tags de la versión candidata.
+- **`promover`** es **el único paso que mueve el alias `champion`**, con una sola operación del Model Registry (no hay estado «a medias»). Si falla algo antes (datos, entrenamiento, evaluación, MLflow caído), el alias no se toca. Si el candidato no gana, la tarea queda *skipped*.
+- **`registrar_resultado`** corre siempre (`trigger_rule=all_done`), hace upsert en `reentrenamientos` y, si el reentrenamiento falló, termina con error para que la ejecución quede `failed`.
+
+**Criterio de promoción.** `promover ⇔ costo_candidato < costo_vigente × (1 − 1,5 %)`, con el **costo de negocio total** (`cantidad_sugerida` contra la venta real, con `costos.csv`) en la misma ventana de prueba.
+- *Por qué el costo y no MAE/WAPE:* es lo que le importa a NovaMercado y lo que optimiza el newsvendor (D12). Las métricas técnicas se registran, pero no deciden.
+- *Por qué un margen de 1,5 %:* cada promoción tiene riesgo operativo; una diferencia menor es ruido de la ventana de prueba. Es una constante (`MARGEN_PROMOCION`) y se puede pasar como argumento. El 1,5 % es una elección justificada, no calibrada con datos: con más ejecuciones se podría estimar la variabilidad real.
+- *Casos límite (todos documentados en pruebas):* sin vigente → el candidato se promueve; costo del candidato inválido (NaN, infinito, negativo) o del vigente inválido (≤ 0) → **no** se promueve; empate o borde exacto → no se promueve.
+- *Alternativas descartadas:* promover siempre el más reciente (un modelo peor podría reemplazar al bueno); promover si mejora estrictamente (cambia de modelo por ruido); exigir mejora en todas las métricas (demasiado conservador y las métricas no son comparables entre sí).
+
+**Comparación justa.** Candidato y vigente se evalúan en la **misma ventana** y ninguno entrenó con ella:
+- si el vigente terminó de entrenar *antes* de la ventana (`ultimo_dia` < inicio de la prueba) se evalúa tal cual está desplegado (`vigente_real`);
+- si ya vio parte de la ventana (p. ej. no hubo datos nuevos desde que se entrenó), compararlo sería injusto a su favor: se **reajusta su misma receta** (tipo y parámetros) con fecha < corte y se evalúa ese (`vigente_reajustado`);
+- si el número de filas de prueba difiere entre ambos, el DAG falla (`ventanas distintas`) en lugar de comparar cosas distintas.
+
+**Operación.**
+- **Sin reintentos** (`retries=0`) y con timeouts por tarea y `dagrun_timeout` de 9 min: un reintento dentro de una ejecución lenta rompería el límite de 10 min. Un fallo es definitivo y se vuelve a disparar a mano.
+- **`max_active_runs=1`:** un segundo `POST /admin/reentrenar` **no se rechaza**: ambos responden 202 y Airflow deja el segundo en cola (`en_curso`) hasta que termine el primero. Así no se entrenan dos modelos a la vez ni se pierde una solicitud.
+- **Las tareas leen de `app-db` con su propia conexión** (`APP_DB_URL`), nunca de la base de metadatos de Airflow (prohibido en Airflow 3). La imagen de Airflow incluye `ml/`, así que DAG, API e `init` usan el mismo código y las mismas versiones.
+- **La API elige el `dag_run_id`** (`reentrenar_<uuid>`) y guarda la fila `en_curso` en `reentrenamientos` **antes** de disparar; si Airflow no responde, borra la fila y responde 503 (no queda un `en_curso` eterno). Si `app-db` está caída, 503 y no se dispara nada.
+- **`GET /admin/reentrenar/{id}`:** 404 para ids que la API no creó (no se pregunta a Airflow). El estado sale de Airflow (`queued`/`running` → `en_curso`, `success` → `exitoso`, `failed` → `fallido`); si Airflow no responde o no conoce la ejecución, se usa lo guardado por el DAG. `version` es la **vigente al terminar**: la nueva si se promovió, la anterior si no. Si el DAG murió antes de escribir (p. ej. por timeout), el motivo por omisión lo dice y aclara que el vigente no se tocó.
+- **Adopción por la API:** el alias se mueve en MLflow, pero la API aún no lo sondea: hasta el Paso 7 hay que reiniciarla para que `/modelo` cambie.
+
+**Pendiente de verificar con el sistema levantado:** ejecución real del DAG (con promoción y sin ella), el límite de 10 min y que un fallo deje el alias intacto en MLflow real. Las pruebas unitarias cubren la lógica con fakes.

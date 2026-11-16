@@ -151,6 +151,10 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME}
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      # POST /admin/reentrenar dispara el DAG por la API REST de Airflow (JWT).
+      AIRFLOW_URL: http://airflow-apiserver:8080
+      AIRFLOW_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
     depends_on:
       app-db:
         condition: service_healthy
